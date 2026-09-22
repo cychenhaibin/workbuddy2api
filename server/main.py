@@ -150,7 +150,7 @@ async def cache_headers(request: Request, call_next):
 
     安全头说明：
     - X-Content-Type-Options: 阻止浏览器嗅探类型（防内容被当作脚本执行）
-    - X-Frame-Options / frame-ancestors: 禁止被其他站点内嵌（防点击劫持）
+    - CSP frame-ancestors: 只允许本站与指定父页面内嵌（防未授权嵌入）
     - Referrer-Policy: 跨站请求不带完整 URL（避免泄露路径）
     - CSP: 只允许同源资源与内联样式（前端使用内联样式属性）；
       限制外联目标，降低 XSS 得手后的影响面
@@ -195,7 +195,6 @@ async def cache_headers(request: Request, call_next):
         response.headers['Cache-Control'] = 'no-cache'
 
     response.headers.setdefault('X-Content-Type-Options', 'nosniff')
-    response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'no-referrer')
     response.headers.setdefault('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
     response.headers.setdefault(
@@ -206,7 +205,7 @@ async def cache_headers(request: Request, call_next):
         "style-src 'self' 'unsafe-inline'; "
         "script-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; "
-        "frame-ancestors 'none'; "
+        "frame-ancestors 'self' https://fluxa.camila.qzz.io; "
         "base-uri 'self'; "
         "form-action 'self'",
     )
