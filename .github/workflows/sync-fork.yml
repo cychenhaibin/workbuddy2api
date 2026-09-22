@@ -1,0 +1,50 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    # GitHub Actions cron uses UTC. Run every day at 03:00 UTC.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: ithtelab/workbuddy-manager
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    name: Sync fork
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git"
+          git remote -v
+
+      - name: Fetch upstream
+        run: git fetch upstream "${{ env.UPSTREAM_BRANCH }}"
+
+      - name: Merge upstream into fork
+        run: git merge --no-edit "upstream/${{ env.UPSTREAM_BRANCH }}"
+
+      - name: Push changes
+        run: git push origin "${{ env.TARGET_BRANCH }}"
