@@ -208,7 +208,7 @@ jobs:
       # ── 构建并发布容器镜像（Docker 部署方案，issue #7）──────────────
       #
       # 推送到 GHCR（GitHub 容器仓库），用户可直接：
-      #   docker pull ghcr.io/<owner>/workbuddy-manager:latest
+      #   docker pull ghcr.io/<owner>/workbuddy2api:latest
       # 而不是自己 clone + build（后者要装 Node 构建前端，门槛高）。
       #
       # **同时构建 amd64 与 arm64**：原先用 `docker build` 只产出 runner 自己的
@@ -225,7 +225,7 @@ jobs:
         if: github.event_name == 'push' || inputs.tag != ''
         id: image
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy-manager"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy2api"
           echo "name=${IMAGE,,}" >> $GITHUB_OUTPUT
 
       # 下面这几步与镜像构建同属「附属产物」链路，一并加 continue-on-error：
@@ -319,6 +319,6 @@ jobs:
 
           或者用容器部署（另见仓库内 docker-compose.yml）：
           ```bash
-          docker pull ghcr.io/${{ github.repository_owner }}/workbuddy-manager:${{ steps.vars.outputs.version }}
+          docker pull ghcr.io/${{ github.repository_owner }}/workbuddy2api:${{ steps.vars.outputs.version }}
           ```
           EOF

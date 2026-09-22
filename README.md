@@ -429,7 +429,7 @@ docker compose logs workbuddy-manager | grep -A2 密码   # 首启随机密码
 也可以直接用构建好的镜像（每次发版会推到 GHCR）：
 
 ```bash
-docker pull ghcr.io/ithtelab/workbuddy-manager:latest
+docker pull ghcr.io/cychenhaibin/workbuddy2api:latest
 ```
 
 > 镜像**同时提供 `linux/amd64` 与 `linux/arm64`**（Apple Silicon、ARM 云主机可直接拉取，

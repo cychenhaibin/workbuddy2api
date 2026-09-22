@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/cychenhaibin/workbuddy-manager
+  IMAGE_NAME: ghcr.io/cychenhaibin/workbuddy2api
 
 jobs:
   docker:

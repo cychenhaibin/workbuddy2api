@@ -498,7 +498,7 @@ docker compose logs workbuddy-manager | grep -A2 password   # first-boot random 
 Or pull the prebuilt image (pushed to GHCR on every release):
 
 ```bash
-docker pull ghcr.io/ithtelab/workbuddy-manager:latest
+docker pull ghcr.io/cychenhaibin/workbuddy2api:latest
 ```
 
 > The image ships for **both `linux/amd64` and `linux/arm64`** (Apple Silicon and ARM
