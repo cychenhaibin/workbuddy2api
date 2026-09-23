@@ -33,6 +33,11 @@ export interface Account {
    * 账号级冷却时间不足以表达，故逐条列出。
    * 字段名照上游 /status 的 JSON：model / until / reset_at / reason。
    */
+  /**
+   * 本端给这个账号写的备注（issue #67）。按 uid 存在本端库里，不在上游账号文件里，
+   * 所以临时停用（改文件名）不会丢。没有备注时是空串（不是缺字段）。
+   */
+  note?: string;
   rate_limited_models?: {
     model: string;
     /** 该模型的冷却截止（已被 soft_rate_max 截断） */
@@ -297,6 +302,14 @@ export interface RequestLog {
    * 与 latency_ms 的区别：latency_ms 含模型生成全部内容的耗时，回答越长越大，
    * 反映不出上游响应快慢；首字延迟才是「上游多久开始回话」。
    */
+  /**
+   * 提示词缓存的三段 token（issue #69）：上游（腾讯）在流式末帧 usage 里给。
+   * **null = 上游没给这三个字段**（老上游），与「给了 0」不是一回事——
+   * 后者代表这次请求确实没命中缓存。界面据此显示「—」而不是 0%。
+   */
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
+  cache_write_tokens: number | null;
   first_token_ms: number | null;
   ua: string | null;
   error: string | null;
@@ -750,4 +763,35 @@ export interface AuditLog {
 export interface AuditLogPage {
   items: AuditLog[];
   total: number;
+}
+
+/**
+ * 上游自己那份统计（`/v1/stats`，issue #59）。
+ *
+ * 字段名照上游 JSON。**口径与面板的用量统计不同**：这份含直连上游的调用，
+ * 且自上游进程启动累计——界面必须标注清楚，别与按时段统计的数字混着看。
+ */
+export interface UpstreamStatRow {
+  model?: string;
+  requests?: number;
+  success?: number;
+  failed?: number;
+  total_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  credit?: number;
+  cache_hit_rate?: number;
+}
+
+export interface UpstreamStats {
+  /** 取不到时为 false，此时只有 error */
+  available: boolean;
+  error?: string;
+  /** 上游可关闭统计采集；关闭时 enabled=false 且 message 说明原因 */
+  enabled?: boolean;
+  message?: string;
+  since?: string;
+  uptime_sec?: number;
+  total?: UpstreamStatRow;
+  models?: UpstreamStatRow[];
 }

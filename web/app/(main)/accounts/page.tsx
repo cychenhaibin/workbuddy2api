@@ -15,6 +15,8 @@ import {
   CalendarCheck,
   Coins,
   ChevronRight,
+  RotateCcw,
+  StickyNote,
 } from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
@@ -33,6 +35,7 @@ import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
+import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -55,6 +58,9 @@ export default function AccountsPage() {
   const [upstream, setUpstream] = useState<UpstreamStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
+  // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
+  // 备注为初值，否则会拿上一个账号的内容去保存。
+  const [noteTarget, setNoteTarget] = useState<Account | null>(null);
   const [busyFile, setBusyFile] = useState<string | null>(null);
   const [checkinAllBusy, setCheckinAllBusy] = useState(false);
   /** 每个账号积分是实时查询还是命中缓存（含缓存已存在秒数） */
@@ -141,14 +147,20 @@ export default function AccountsPage() {
     try {
       const r = await accountApi.checkinAll();
       const failed = r.total - r.succeeded;
+      // 不适用（国际版）的账号不计入分母，但要说明，否则用户看到「5/5 成功」
+      // 会以为少了一个号——那个号无论点多少次都是「已跳过」。
+      const note = r.skipped > 0 ? ' ' + t('accounts.checkinSkippedNote', {skipped: r.skipped}) : '';
       if (r.total === 0) {
-        notify.info(t('accounts.noCheckinTargets'));
+        notify.info(t('accounts.noCheckinTargets'), note.trim() || undefined);
       } else if (failed === 0) {
-        notify.ok(t('accounts.checkinAllDone'), t('accounts.checkinAllDoneDetail', {ok: r.succeeded, total: r.total}));
+        notify.ok(
+          t('accounts.checkinAllDone'),
+          t('accounts.checkinAllDoneDetail', {ok: r.succeeded, total: r.total}) + note,
+        );
       } else {
         notify.warn(
           t('accounts.checkinPartial', {failed}),
-          t('accounts.checkinPartialDetail', {ok: r.succeeded, total: r.total}),
+          t('accounts.checkinPartialDetail', {ok: r.succeeded, total: r.total}) + note,
         );
       }
       await load();
@@ -181,7 +193,12 @@ export default function AccountsPage() {
   );
 
   /** 执行单账号操作（签到 / 测活 / 刷新 / 删除），成功后同步底栏计数 */
-  async function run(file: string, fn: () => Promise<unknown>, okMsg: string) {
+  async function run(
+    file: string,
+    fn: () => Promise<unknown>,
+    okMsg: string,
+    preferOkMsg = false,
+  ) {
     setBusyFile(file);
     try {
       const res = (await fn()) as {
@@ -202,7 +219,7 @@ export default function AccountsPage() {
           }));
         }
       }
-      (ok ? notify.ok : notify.err)(res.message || okMsg);
+      (ok ? notify.ok : notify.err)(ok && preferOkMsg ? okMsg : (res.message || okMsg));
       await load();
       window.dispatchEvent(new Event('workbuddy-manager:accounts-changed'));
     } catch (e) {
@@ -390,7 +407,8 @@ export default function AccountsPage() {
    *  —— 有人只能进容器翻 state.json 才知道。
    *
    *  所以它与状态徽章**并列**展示（不是替代）：账号确实可用，只是有模型受限。
-   *  悬停给出每个受限模型与预计恢复时间——上游台账里带权威的重置时刻。 */
+   *  徽章里列具体有哪些模型受限，悬停再给出每个模型的恢复时间——上游台账里
+   *  带权威的重置时刻。 */
   function renderModelLimit(a: Account) {
     const limited = rateLimitedModels(a);
     if (!limited.length) return null;
@@ -407,10 +425,15 @@ export default function AccountsPage() {
           : t('accounts.modelLimited');
       return `${m.model} · ${why}`;
     });
-    const first = limited[0];
-    const shown = limited.length === 1
-      ? first.model
-      : t('accounts.modelsCount', {count: limited.length, n: limited.length});
+    // 徽章里**直接给出模型名**（用户反馈：只知道「有 2 个模型受限」不够用，得知道
+    // 是哪些，才能换模型或者告诉调用方避开它们）。名字可能很长（`global:` 前缀的
+    // 型号尤甚），所以最多列两个，其余用「+N」带过；完整清单与各自恢复时间仍在
+    // 悬停里——那里才是逐条说明的地方。
+    const MAX_INLINE = 2;
+    const names = limited.slice(0, MAX_INLINE).map((m) => m.model).join(sep);
+    const shown = limited.length > MAX_INLINE
+      ? `${names} +${limited.length - MAX_INLINE}`
+      : names;
     return (
       <Badge
         variant="secondary"
@@ -535,8 +558,22 @@ export default function AccountsPage() {
     // 「停用把签到也停了」，正好把这条路与改名那条的区别抹掉了。
     const viaBit = a.manual_disabled === true;
     const off = paused || viaBit;
+    const hasClearableState = a.cooling === true || rateLimitedModels(a).length > 0;
     return (
       <div className="flex justify-end gap-1">
+        {/* 备注（issue #67）：只动本端库里的一行文本，不碰上游、不重启容器，
+            所以放在最前——它是最轻的动作。任何状态下的账号都能写备注：
+            停用的号恰恰更容易忘了它是谁。 */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 rounded-md"
+          title={a.note ? t('accounts.noteEditTitle') : t('accounts.noteAdd')}
+          disabled={busy}
+          onClick={() => setNoteTarget(a)}
+        >
+          <StickyNote className={'h-3.5 w-3.5 ' + (a.note ? 'text-amber-600 dark:text-amber-400' : '')} />
+        </Button>
         {/* 临时停用 / 启用（issue #21、#45）。放在最前：它是最轻的「止血」动作——
             某个号在拖后腿（一直失败、触发风控）时，先停用它比删掉更合适
             （删除会丢凭证、只能重新扫码；停用是可逆的）。 */}
@@ -557,6 +594,31 @@ export default function AccountsPage() {
               <KeyRound className="h-3.5 w-3.5" />
             </Button>
           </>
+        )}
+        {!paused && hasClearableState && (
+          <ConfirmDialog
+            title={t('accounts.forceClearCoolingTitle')}
+            description={t('accounts.forceClearCoolingDesc')}
+            confirmText={t('accounts.forceClearCoolingConfirm')}
+            destructive
+            onConfirm={() => run(
+              a.file,
+              () => accountApi.clearCooling(a.file),
+              t('accounts.forceClearCoolingDone'),
+              true,
+            )}
+            trigger={
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 rounded-md text-rose-600 hover:text-rose-700 dark:text-rose-400"
+                title={t('accounts.forceClearCooling')}
+                disabled={busy}
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            }
+          />
         )}
         <Button
           variant="ghost"
@@ -694,6 +756,11 @@ export default function AccountsPage() {
                       {a.nickname || t('accounts.unnamed')}
                     </div>
                     <div className="truncate font-mono text-[10px] text-muted-foreground">{a.uid}</div>
+                    {a.note ? (
+                      <div className="truncate text-[10px] text-muted-foreground" title={a.note}>
+                        {t('accounts.noteLabel')}{a.note}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
@@ -740,9 +807,16 @@ export default function AccountsPage() {
                 <TableCell className="pl-4">
                   <div className="flex items-center gap-2.5">
                     {renderAvatar(a)}
-                    <span className={'truncate text-sm font-medium ' + (a.is_expired ? 'text-muted-foreground' : '')}>
-                      {a.nickname || t('accounts.unnamed')}
-                    </span>
+                    <div className="min-w-0">
+                      <div className={'truncate text-sm font-medium ' + (a.is_expired ? 'text-muted-foreground' : '')}>
+                        {a.nickname || t('accounts.unnamed')}
+                      </div>
+                      {a.note ? (
+                        <div className="truncate text-[10px] text-muted-foreground" title={a.note}>
+                          {t('accounts.noteLabel')}{a.note}
+                        </div>
+                      ) : null}
+                    </div>
                     <Badge
                       variant="secondary"
                       className={
@@ -802,6 +876,12 @@ export default function AccountsPage() {
       </div>
 
       <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={load} />
+      <AccountNoteDialog
+        account={noteTarget}
+        open={noteTarget !== null}
+        onOpenChange={(open) => { if (!open) setNoteTarget(null); }}
+        onSaved={load}
+      />
     </div>
   );
 }

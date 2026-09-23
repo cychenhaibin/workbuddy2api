@@ -153,7 +153,8 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
 - **Inbound IP control** — global allow/deny lists with CIDR support; allowlist mode can
   restrict access to trusted sources only
 - **Full audit trail** — per call: key, IP, model, status code, **time to first token**,
-  total latency, token usage and **actual credit charged** (from upstream `usage.credit`;
+  total latency, token usage, **actual credit charged** and **prompt-cache hits**
+  (credit comes from upstream `usage.credit`;
   shown as `—` when the upstream does not report it, which is different from charging 0)
 
 ### Visual settings
@@ -291,12 +292,17 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
 <img src="docs/images/keys.png" alt="API keys" width="100%" />
 
 ### Request logs
-> Filter by time / key / status / model / IP, with **time to first token**, total latency and tokens
+> Filter by time / key / status / model / IP, with **time to first token**, total latency, tokens and **prompt-cache hits**
 
 "First token" = from sending the upstream request to the first delta containing content.
 It reflects **how fast the upstream starts responding**. "Total latency" includes the whole
 generation, so it grows with answer length — useful for overall cost per request.
 Non-streaming requests have no intermediate steps, so the first-token column shows `—`.
+
+The cache marker after the token count (green "cache N%" / amber "no cache hit") comes from the
+usage data the upstream returns; it tells you whether a repeated prefix is **actually hitting the
+cache**, which is billed much cheaper. When the upstream does not return this data the marker is
+omitted (the detail view says "not captured") — that is not the same as "no cache hit".
 
 <img src="docs/images/logs.png" alt="Request logs" width="100%" />
 
@@ -504,6 +510,34 @@ docker pull ghcr.io/cychenhaibin/workbuddy2api:latest
 > The image ships for **both `linux/amd64` and `linux/arm64`** (Apple Silicon and ARM
 > cloud hosts can pull it directly, with no QEMU emulation). `docker pull` picks the
 > right one for your machine automatically.
+
+**Want an image you built yourself? Just fork the repo** — the one above is built by the
+maintainer on each release. If you need to change something for your own use (different
+defaults, an extra dependency, or you simply prefer not to depend on someone else's
+registry), fork this repository, drop the fork-only workflow into `.github/workflows/`
+and push once:
+
+```bash
+mkdir -p .github/workflows
+cp deploy/fork-image/build-image.yml .github/workflows/
+git add .github/workflows/build-image.yml && git commit -m "ci: build my own image" && git push
+```
+
+The workflow needs **no edits at all**: the image's namespace, the branch it watches, and
+the provenance labels baked into the image are all derived from your fork at run time
+(whoever forks publishes under their own name, and renaming the default branch does not
+break it). Once the build finishes (a few minutes), pull your own copy — the run summary
+prints the real username:
+
+```bash
+docker pull ghcr.io/<your-username>/workbuddy-manager-multiarch:latest
+```
+
+> The extra `-multiarch` suffix is **not a typo**: the `workbuddy-manager` package name
+> may already be taken in the namespace by a package that is not linked to your repo, and
+> a fork has no write access to that one, so the push would fail. You can also publish to
+> Docker Hub at the same time (two secrets enable it automatically). Full details in
+> [deploy/fork-image/README.md](deploy/fork-image/README.md).
 
 **The container build has the same capabilities as a host install** — the compose file
 mounts three things to make that true:

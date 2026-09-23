@@ -124,7 +124,7 @@
   **思考强度**（接 `reasoning_effort`，只列该模型支持的档位）、流式输出可中断，
   **右下角实时显示本次消耗积分**（取自上游 `usage.credit`）。仅管理员可用
 - **入站 IP 管控** —— 全局白/黑名单（支持 CIDR），白名单模式可做到只放行可信来源
-- **全量审计** —— 每次调用记录密钥、IP、模型、状态码、**首字延迟**、总耗时、Token 消耗与**实际扣费**
+- **全量审计** —— 每次调用记录密钥、IP、模型、状态码、**首字延迟**、总耗时、Token 消耗、**实际扣费**与**提示词缓存命中**
   （取自上游 `usage.credit`；上游未返回时显示 `—`，与「扣了 0」区分开）
 
 ### 可视化设置
@@ -233,11 +233,15 @@
 <img src="docs/images/keys.png" alt="API 密钥" width="100%" />
 
 ### 请求日志
-> 按时间 / 密钥 / 状态 / 模型 / IP 筛选，含**首字延迟**、总耗时与 Token 计量
+> 按时间 / 密钥 / 状态 / 模型 / IP 筛选，含**首字延迟**、总耗时、Token 计量与**提示词缓存命中**
 
 「首字」= 从发起上游请求到收到第一个含正文的 delta，反映**上游响应快慢**；
 「总耗时」含模型生成全程，回答越长越大，用于看单次请求的整体开销。
 非流式请求没有中间过程，首字显示 `—`。
+
+Token 后面的缓存标记（绿色「缓存 N%」/ 琥珀色「未命中」）来自上游返回的用量数据，
+用来判断同一段前缀**有没有真的吃到缓存**——命中部分计费便宜得多。上游不返回这项数据时
+标记不显示（详情里写「未采集」），与「没有命中」不是一回事。
 
 <img src="docs/images/logs.png" alt="请求日志" width="100%" />
 
@@ -434,6 +438,29 @@ docker pull ghcr.io/cychenhaibin/workbuddy2api:latest
 
 > 镜像**同时提供 `linux/amd64` 与 `linux/arm64`**（Apple Silicon、ARM 云主机可直接拉取，
 > 无需 QEMU 模拟）。`docker pull` 会按你的机器架构自动选择对应的那一份。
+
+**想用自己构建的镜像？fork 一下就行** —— 上面那份是维护者发版时构建的。如果你要
+改点什么再自己用（换默认配置、加个依赖，或者只是不想依赖别人的镜像仓库），fork
+本仓库后把 fork 专用工作流放进 `.github/workflows/`，推一次代码就自动构建：
+
+```bash
+mkdir -p .github/workflows
+cp deploy/fork-image/build-image.yml .github/workflows/
+git add .github/workflows/build-image.yml && git commit -m "ci: 构建自己的镜像" && git push
+```
+
+工作流**不用改任何内容**：镜像归属、触发分支、镜像里记的来源信息都按你 fork 的实际
+情况自动决定（谁 fork 就推到谁名下，默认分支改了名也照常触发）。构建完成后（几分钟）
+拉取你自己那一份，真实用户名见那次运行的摘要：
+
+```bash
+docker pull ghcr.io/<你的用户名>/workbuddy-manager-multiarch:latest
+```
+
+> 镜像名比上游多一个 `-multiarch` 后缀，这**不是笔误**：`workbuddy-manager` 这个
+> 包名可能已被一个未链接到本仓库的同名包占用，那种包 fork 拿不到写权限、推送会
+> 失败。也可以顺便推一份到 Docker Hub（加两个 Secret 即自动启用）。完整说明见
+> [deploy/fork-image/README.md](deploy/fork-image/README.md)。
 
 **容器版与宿主版的能力是一致的** —— compose 里默认挂载了三样东西让它们对齐：
 

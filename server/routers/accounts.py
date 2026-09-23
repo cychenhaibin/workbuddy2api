@@ -25,6 +25,11 @@ async def list_accounts(user: dict = Depends(security.current_user)) -> dict:
     accounts = wb2api.list_auth_accounts()
     status = await wb2api.get_status()
     wb2api.merge_pool_status(accounts, status)
+    # 备注随列表一次带回（issue #67）：按 uid 取，没有备注的账号给空串而不是缺字段
+    # —— 前端两处视图（手机卡片 / 桌面表格）都直接读它，缺字段会多一处判空。
+    notes = db.account_notes()
+    for a in accounts:
+        a['note'] = notes.get(str(a.get('uid') or ''), '')
     synced = sum(1 for a in accounts if a.get('credits') is not None)
     return {
         'total': len(accounts),
@@ -466,7 +471,8 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
         if not supports_checkin(realm_of(auth)):
             msg = '国际版无签到体系，已跳过'
             db.add_checkin_log(uid, nickname, 'manual-batch', False, -2, msg)
-            return {'nickname': nickname, 'ok': False, 'code': -2, 'message': msg}
+            return {'nickname': nickname, 'ok': False, 'skipped': True,
+                    'code': -2, 'message': msg}
 
         async with sem:
             # 传完整 auth dict：billing 域要带 X-User-Id 等身份头
@@ -483,8 +489,18 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
         return {'nickname': nickname, 'ok': ok, 'code': code, 'message': message}
 
     results = await asyncio.gather(*(one(a) for a in accounts)) if accounts else []
-    succeeded = sum(1 for r in results if r['ok'])
-    return {'total': len(results), 'succeeded': succeeded, 'results': list(results)}
+    # 「不适用」的账号（国际版没有签到体系）不进分母。
+    # 它既不会成功、也不是失败，算进 total 会让界面显示成「5/6 个账号成功」，
+    # 用户会以为有一个号漏签了、反复去点——而那个号无论点多少次都是「已跳过」。
+    # 单独用 skipped 报出来，让界面能说清「N 个不适用」。
+    applicable = [r for r in results if not r.get('skipped')]
+    succeeded = sum(1 for r in applicable if r['ok'])
+    return {
+        'total': len(applicable),
+        'succeeded': succeeded,
+        'skipped': len(results) - len(applicable),
+        'results': list(results),
+    }
 
 
 @router.get('/checkin-logs')
@@ -922,13 +938,78 @@ async def account_refresh(filename: str, user: dict = Depends(security.require_a
         return {'ok': False,
                 'message': f'{message}，但写入账号文件失败：{exc}（有效期未保存）'}
 
-    reloaded = await reload.restart_now()
+    # restart_now() 返回 (ok, message) 二元组，必须解包：直接当布尔用会因为
+    # 非空元组恒为真，从而在重载失败时仍报「已重载生效」（且 reload_triggered
+    # 会变成数组、与前端声明的 boolean 不符）。
+    reloaded, reload_error = await reload.restart_now()
     return {
         'ok': True,
-        'message': message + ('，上游已重载生效' if reloaded else '；请手动重启上游以生效'),
+        'message': message + ('，上游已重载生效' if reloaded
+                              else f'；上游重载失败：{reload_error}，请在宿主机重启上游容器'),
         'reload_triggered': reloaded,
         'expires_at': fields.get('expires_at'),
     }
+
+
+@router.post('/accounts/{filename}/clear-cooling')
+async def account_clear_cooling(
+    filename: str,
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """强制退出账号级冷却、熔断/降权和模型级限流状态。
+
+    上游没有提供清除运行态冷却的管理接口，而 state.json 每 5 秒会被内存
+    Flush 覆盖。因此这个动作必须：停上游 → 原子修改目标账号 → 启上游 →
+    验证实时状态。只改目标 uid，不碰凭证、积分、禁用位或其它账号。
+    """
+    try:
+        raw = wb2api.read_account_file_any(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    uid = str((raw.get('account') or {}).get('uid') or '').strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位上游状态')
+
+    ok, message, detail = await wb2api.force_clear_account_cooling(uid)
+    return {'ok': ok, 'message': message, **(detail or {})}
+
+
+@router.put('/accounts/{filename}/note')
+async def account_set_note(
+    filename: str,
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """给账号写一句备注（issue #67）——比如「张叔叔」「备用号」「给小李用的」。
+
+    为什么需要：用手机号邀请注册的账号，昵称往往认不出是谁，删号时不知道该删哪个。
+
+    存法见 `db.account_notes` 的注释：**按 uid** 存在本端库里（不写进上游的账号
+    文件——那是上游按自己 schema 读写的文件，塞自定义字段会被它覆盖或超出 schema）。
+    uid 是账号的稳定标识，所以临时停用（改文件名）不会让备注丢。
+
+    空串 = 删除备注（不留空行）。
+    """
+    try:
+        raw = wb2api.read_account_file_any(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    uid = str((raw.get('account') or {}).get('uid') or '').strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法保存备注')
+
+    # 先把**所有空白收起成单个空格**（审查补）：备注在列表里是单行展示 + 悬停看
+    # 全文，粘进来的多行文本（或中间一串空格）会让它看起来像坏数据；顺带把
+    # 「只有换行/空格」的输入归成空串 = 清除。
+    #
+    # 截断而不是拒绝：备注是给人看的短文本，粘多了不该报错丢掉整句。
+    # 上限取 100 字符（界面上也是这个 maxLength），够写清是谁/做什么用。
+    note = ' '.join(str(body.get('note') or '').split())[:100]
+    if note:
+        db.set_account_note(uid, note)
+    else:
+        db.delete_account_note(uid)
+    return {'ok': True, 'uid': uid, 'note': note}
 
 
 @router.delete('/accounts/{filename}')

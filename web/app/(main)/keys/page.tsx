@@ -5,6 +5,7 @@ import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucid
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
 import {keyApi, errText} from '@/lib/api';
+import {BASE_PATH} from '@/lib/base-path';
 import type {ApiKey} from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
@@ -263,8 +264,11 @@ export default function KeysPage() {
     }
   }
 
-  // 下游接入地址：客户端才能拿到当前 origin，静态导出阶段为空
-  const baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
+  // 下游接入地址：客户端才能拿到当前 origin，静态导出阶段为空。
+  // 子路径部署时网关也挂在前缀下（反代剥掉前缀再转发），所以要带上 basePath，
+  // 否则会把用户引到一个 404 的地址。
+  const baseUrl =
+    typeof window !== 'undefined' ? `${window.location.origin}${BASE_PATH}` : '';
 
   return (
     <div className="flex flex-col gap-4 md:gap-6">
@@ -322,9 +326,9 @@ export default function KeysPage() {
                       <Badge variant="secondary" className="rounded-full text-emerald-600 dark:text-emerald-400">{t('keys.badgeOk')}</Badge>
                     )}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {k.expires_at ? fmtDateTime(k.expires_at) : t('keys.neverExpires')}
-                  </TableCell>
+                  {/* 版本必须排在有效期**前面**，与表头一致（issue #68：这两列的
+                      单元格与表头顺序反了，界面上「版本」列显示的是有效期、「有效期」
+                      列显示的是版本 —— 用户看到的就是这个错位）。 */}
                   <TableCell>
                     {k.realm === 'global' ? (
                       <Badge variant="secondary" className="rounded-full text-[10px]">{t('realm.global')}</Badge>
@@ -340,6 +344,9 @@ export default function KeysPage() {
                         {t('keys.realmUnset')}
                       </span>
                     )}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {k.expires_at ? fmtDateTime(k.expires_at) : t('keys.neverExpires')}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {k.max_ips ? t('keys.ipLimit', {n: k.max_ips}) : t('keys.ipUnlimited')} /{' '}
