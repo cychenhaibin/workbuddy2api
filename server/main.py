@@ -11,13 +11,14 @@ from fastapi.staticfiles import StaticFiles
 
 import logging
 
-from . import config, db, security
+from . import config, db, redpacket, security
 from .iputil import client_ip
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    responses, security as security_router, settings, stats, system,
+    redpackets, responses, security as security_router, settings, stats,
+    system, tokens, upstreams,
 )
-from .services import renew, tasklog, taskrun
+from .services import accountlog, renew, tasklog, taskrun
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,11 @@ async def lifespan(app: FastAPI):
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
     _warn_if_exposed()
+    # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
+    # 等于那些红包只能自己发 key、没法让大家抽。
+    filled = redpacket.backfill_codes()
+    if filled:
+        logger.info('为 %d 个旧红包补上了抽奖码', filled)
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
@@ -37,12 +43,16 @@ async def lifespan(app: FastAPI):
     # token 自动续期（issue #40）：上游只在「保活时刻」与「有流量时」刷新，
     # 长期闲置的账号会一路走到过期。这里按剩余寿命巡检补齐那个空档。
     renew.start_scheduler()
+    # 请求日志的「账号」回填（issue #69）：账号是上游选的、不在响应里回传，
+    # 只能从它的容器日志里读出来再按时间对回去（见 accountlog 的说明）。
+    accountlog.start_collector()
     try:
         yield
     finally:
         tasklog.stop_collector()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
+        accountlog.stop_collector()
 
 
 def _warn_if_exposed() -> None:
@@ -64,7 +74,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.66',
+    version='1.0.73',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -125,10 +135,18 @@ async def limit_api_body(request: Request, call_next):
 app.include_router(auth.router)
 app.include_router(accounts.router)
 app.include_router(keys.router)
+# 红包：批量发放带额度的密钥（与密钥同属「分发」这件事，所以挨着放）
+app.include_router(redpackets.router)
+# 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
+app.include_router(redpackets.claim_router)
 app.include_router(logs.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
+# 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
+app.include_router(tokens.router)
 app.include_router(settings.router)
+# 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
+app.include_router(upstreams.router)
 app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
@@ -344,3 +362,70 @@ if config.STATIC_DIR.is_dir():
         if not_found.is_file():
             return FileResponse(not_found, status_code=404)
         return JSONResponse({'error': 'not found'}, status_code=404)
+
+
+# ── 子路径部署（反向代理前缀）────────────────────────────────────────
+#
+# 反向代理把本站挂在 /workbuddy-manager 这类前缀下、且**不剥离**前缀时，后端
+# 收到的路径仍带着前缀 —— 路由、静态挂载与 SPA 兜底全都匹配不上，页面会 404。
+# 这里在最外层统一剥掉，让内部逻辑只看到「前缀之后的路径」。
+#
+# 反向代理若已经剥离了前缀（proxy_pass 带 URI 的常见写法），本中间件找不到
+# 前缀、原样放行 —— 两种反代配置都能工作，nginx 侧不必改。
+#
+# 响应侧同步处理：SPA 的 RSC 兜底等场景会 302 到站内绝对路径（`/xxx`），
+# 不补回前缀就会把用户带出子路径、落到站点根目录。
+#
+# 与 `config.BASE_PATH` 的分工：那个值被用来**主动构造**带前缀的绝对地址
+# （见上面 SPA 兜底的 RedirectResponse）；本中间件负责「进来的路径带前缀」与
+# 「出去的 Location 漏前缀」这两件事。两者都指同一个 WB_BASE_PATH。
+class StripBasePathMiddleware:
+    """纯 ASGI 中间件：剥离请求前缀，并把响应里的站内绝对位置补回前缀。"""
+
+    def __init__(self, app, prefix: str) -> None:
+        self.app = app
+        self.prefix = prefix
+        self._prefix_slash = prefix + '/'
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get('path') or '/'
+        if path == self.prefix or path.startswith(self._prefix_slash):
+            stripped = path[len(self.prefix):] or '/'
+            scope = dict(scope)
+            scope['path'] = stripped
+            scope['raw_path'] = stripped.encode('utf-8')
+
+        async def send_with_prefix(message):
+            if message.get('type') == 'http.response.start' and message.get('headers'):
+                message = dict(message)
+                message['headers'] = [
+                    (k, self._rewrite_location(v) if k.lower() == b'location' else v)
+                    for k, v in message['headers']
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_with_prefix)
+
+    def _rewrite_location(self, value: bytes) -> bytes:
+        try:
+            text = value.decode('latin-1')
+        except Exception:  # noqa: BLE001
+            return value
+        # 只处理站内绝对路径（/ 开头，且不是 //host 这种协议相对写法）
+        if not text.startswith('/') or text.startswith('//'):
+            return value
+        # 已经带前缀的不重复叠加（SPA 兜底那处已自己补过）
+        if text == self.prefix or text.startswith(self._prefix_slash):
+            return value
+        return (self.prefix + text).encode('latin-1')
+
+
+if config.BASE_PATH:
+    # add_middleware 后注册的在外层，所以这行放在文件末尾：请求进来先过它，
+    # 后面的限流 / 缓存头 / 路由看到的都是剥离后的路径。
+    app.add_middleware(StripBasePathMiddleware, prefix=config.BASE_PATH)
+    logger.info('子路径部署：已启用前缀 %s（反代可保留或自行剥离，两者都可用）', config.BASE_PATH)

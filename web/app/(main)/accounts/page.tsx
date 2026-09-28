@@ -13,15 +13,25 @@ import {
   Users,
   Power,
   CalendarCheck,
+  Check,
   Coins,
   ChevronRight,
   RotateCcw,
+  Sparkles,
   StickyNote,
+  FolderInput,
+  TriangleAlert,
 } from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
-import {accountApi, upstreamApi, errText} from '@/lib/api';
-import type {Account, CreditExpiry, CreditsMeta, UpstreamStatus} from '@/lib/types';
+import {accountApi, upstreamApi, upstreamsApi, errText} from '@/lib/api';
+import type {
+  Account,
+  CreditExpiry,
+  CreditsMeta,
+  UpstreamEndpoint,
+  UpstreamStatus,
+} from '@/lib/types';
 import {expiryBarPercent, expiryVisual, fmtAgo, fmtDateTime, fmtNumber, fmtRemain} from '@/lib/format';
 import {
   availabilityLabelKey,
@@ -36,6 +46,9 @@ import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
+import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog';
+import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
+import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -61,7 +74,20 @@ export default function AccountsPage() {
   // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
   // 备注为初值，否则会拿上一个账号的内容去保存。
   const [noteTarget, setNoteTarget] = useState<Account | null>(null);
+  // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
+  const [taskTarget, setTaskTarget] = useState<Account | null>(null);
   const [busyFile, setBusyFile] = useState<string | null>(null);
+  /**
+   * 账号分组（多账号池）：一个分组 = 一套上游实例（账号池）。
+   * null = 默认分组（升级前那套，行为逐字不变）；其余 = 上游记录的 id。
+   */
+  const [groupId, setGroupId] = useState<number | null>(null);
+  /** 分组清单（含默认行）——分组切换条与「移动到分组」都用它 */
+  const [groups, setGroups] = useState<UpstreamEndpoint[]>([]);
+  /** 当前分组的元信息：manageable = 该分组配了本地账号目录（可加 / 移 / 删账号） */
+  const [groupInfo, setGroupInfo] = useState<{name: string; manageable: boolean} | null>(null);
+  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
+  const [moveTarget, setMoveTarget] = useState<Account | null>(null);
   const [checkinAllBusy, setCheckinAllBusy] = useState(false);
   /** 每个账号积分是实时查询还是命中缓存（含缓存已存在秒数） */
   const [creditsMeta, setCreditsMeta] = useState<Record<string, CreditsMeta>>({});
@@ -74,15 +100,25 @@ export default function AccountsPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [accRes, upRes] = await Promise.allSettled([
-      accountApi.list(),
-      upstreamApi.status(),
+    const [accRes, upRes, groupsRes] = await Promise.allSettled([
+      accountApi.list(groupId),
+      upstreamApi.status(groupId),
+      upstreamsApi.list(),
     ]);
-    if (accRes.status === 'fulfilled') setAccounts(accRes.value.accounts);
-    else notify.err(errText(accRes.reason));
+    if (accRes.status === 'fulfilled') {
+      setAccounts(accRes.value.accounts);
+      // 可管理性由后端说了算（该分组配了本地账号目录才能在面板里加 / 移 / 删账号）
+      setGroupInfo({
+        name: accRes.value.upstream?.name || '',
+        manageable: accRes.value.manageable !== false,
+      });
+    } else {
+      notify.err(errText(accRes.reason));
+    }
     if (upRes.status === 'fulfilled') setUpstream(upRes.value);
+    if (groupsRes.status === 'fulfilled') setGroups(groupsRes.value.items || []);
     setLoading(false);
-  }, []);
+  }, [groupId]);
 
   useEffect(() => {
     load();
@@ -96,7 +132,7 @@ export default function AccountsPage() {
       try {
         // force=false：60 秒内重复打开页面直接命中服务端缓存，
         // 不再每次都全量请求腾讯；命中时界面会明确标注「缓存」
-        const r = await accountApi.refreshCredits(false);
+        const r = await accountApi.refreshCredits(false, groupId);
         if (!alive) return;
         setLiveCredits(
           Object.fromEntries(
@@ -111,7 +147,7 @@ export default function AccountsPage() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [groupId]);
 
   // 上游状态（冷却 / 成功计数等）会随时间变化，页面停留时定时刷新，
   // 否则会一直显示打开页面那一刻的旧数据。
@@ -122,7 +158,7 @@ export default function AccountsPage() {
   const refreshCredits = useCallback(async () => {
     setCreditsBusy(true);
     try {
-      const r = await accountApi.refreshCredits(true);
+      const r = await accountApi.refreshCredits(true, groupId);
       setLiveCredits(
         Object.fromEntries(
           Object.entries(r.credits).filter(([, v]) => typeof v === 'number') as [string, number][],
@@ -139,19 +175,34 @@ export default function AccountsPage() {
     } finally {
       setCreditsBusy(false);
     }
-  }, []);
+  }, [groupId]);
 
   /** 批量签到：逐账号记录结果 */
   const checkinAll = useCallback(async () => {
     setCheckinAllBusy(true);
     try {
-      const r = await accountApi.checkinAll();
+      const r = await accountApi.checkinAll(groupId);
       const failed = r.total - r.succeeded;
-      // 不适用（国际版）的账号不计入分母，但要说明，否则用户看到「5/5 成功」
-      // 会以为少了一个号——那个号无论点多少次都是「已跳过」。
-      const note = r.skipped > 0 ? ' ' + t('accounts.checkinSkippedNote', {skipped: r.skipped}) : '';
+      // 两类账号都不计入分母，各自补一句说明，否则用户会以为漏签了：
+      //   skipped — 国际版没有签到体系，点多少次都是「已跳过」
+      //   already — 今天已经签过，本次没再打上游（这正是「不重复签到」的效果）
+      const notes = [
+        r.skipped > 0 ? t('accounts.checkinSkippedNote', {skipped: r.skipped}) : '',
+        r.already > 0 ? t('accounts.checkinAlreadyNote', {n: r.already}) : '',
+      ].filter(Boolean).join(' ');
+      const note = notes ? ' ' + notes : '';
       if (r.total === 0) {
-        notify.info(t('accounts.noCheckinTargets'), note.trim() || undefined);
+        // 「今天都已签到」和「没有可签到的账号」是两回事：前者是正常且理想的状态
+        // （说明当天不用再操作），后者说明池子里没有国内版账号。混成一句「没有
+        // 可签到的账号」会让前者看起来像出了问题。
+        if (r.already > 0) {
+          notify.ok(
+            t('accounts.checkinNothingPending'),
+            t('accounts.checkinNothingPendingDetail', {n: r.already}) + note,
+          );
+        } else {
+          notify.info(t('accounts.noCheckinTargets'), notes.trim() || undefined);
+        }
       } else if (failed === 0) {
         notify.ok(
           t('accounts.checkinAllDone'),
@@ -169,7 +220,7 @@ export default function AccountsPage() {
     } finally {
       setCheckinAllBusy(false);
     }
-  }, [load]);
+  }, [load, groupId]);
 
   /**
    * 将本地 auths 文件与上游账号池状态按 uid 合并。
@@ -181,6 +232,28 @@ export default function AccountsPage() {
   const merged = useMemo(() => mergePoolStatus(accounts, upstream), [accounts, upstream]);
 
   /**
+   * 当前分组是不是和默认分组**共用同一套上游实例**（地址相同）。
+   *
+   * 用户反馈（issue #94）：把账号「移动到分组」之后，切到那一组看，账号一律显示
+   * 「未加载」——在那组里新扫码加的号也一样。这不是加载失败，而是这种分组的必然
+   * 结果：面板把账号文件放进了这一组的目录，而**上游只读默认分组的账号目录**，
+   * 所以那些号根本不在池子里：转发选不中、签到也不行。
+   *
+   * 判定只看地址：地址相同 = 同一套实例（api_key 留空时后端本就沿用默认那把，
+   * 见 upstreamsvc.forward_api_key）。要真正分开账号池得在服务器上再部署一套
+   * workbuddy2api —— 面板不替用户改部署，但必须**在这里把原因说清楚**，
+   * 否则「未加载」看起来像坏了，用户会一直重扫码、重试。
+   */
+  const sharedInstance = useMemo(() => {
+    if (groupId == null) return false;             // 默认分组自己不算
+    const cur = groups.find((g) => g.id === groupId);
+    const def = groups.find((g) => g.is_default);
+    if (!cur || !def) return false;
+    const addr = String(cur.base_url || '').trim();
+    return addr !== '' && addr === String(def.base_url || '').trim();
+  }, [groupId, groups]);
+
+  /**
    * 按当前版本过滤。
    *
    * 上游是单实例双版本共存，账号池里两种账号都有；不区分的话切到国际版
@@ -190,6 +263,24 @@ export default function AccountsPage() {
   const visible = useMemo(
     () => merged.filter((a) => (a.realm ?? 'cn') === realm),
     [merged, realm],
+  );
+
+  /**
+   * 今天还没签到的账号数 —— 「全部签到」按钮据此显示与禁用。
+   *
+   * 判据与签到按钮的**可见条件**保持一致（国内版、且未被面板停用）：面板停用的
+   * 账号已完全退出账号池、签到也跟着停了，把它算进「待签到」会让按钮牌子上
+   * 永远留着一个点不掉、也签不了的数字。
+   */
+  const pendingCheckin = useMemo(
+    () =>
+      visible.filter(
+        (a) =>
+          (a.realm ?? 'cn') === 'cn' &&
+          a.disabled_by_panel !== true &&
+          a.checkin_today == null,
+      ).length,
+    [visible],
   );
 
   /** 执行单账号操作（签到 / 测活 / 刷新 / 删除），成功后同步底栏计数 */
@@ -229,12 +320,29 @@ export default function AccountsPage() {
     }
   }
 
+  /**
+   * 删除当前分组（只删面板记录，账号目录与文件不动）。
+   *
+   * 两道闸在后端：分组里还有账号、或有密钥绑着它 → 409 且说明数量，这里原样弹出。
+   */
+  async function deleteGroup() {
+    if (groupId == null) return;
+    try {
+      await upstreamsApi.remove(groupId);
+      notify.ok(t('accounts.groupDeleted'));
+      setGroupId(null);
+      await load();
+    } catch (e) {
+      notify.err(errText(e));
+    }
+  }
+
   /** 仅重启上游容器，不涉及单个账号，因此单独处理 */
   const [restarting, setRestarting] = useState(false);
   async function restartUpstream() {
     setRestarting(true);
     try {
-      const res = await accountApi.restart();
+      const res = await accountApi.restart(groupId);
       (res.ok ? notify.ok : notify.err)(res.message || t('accounts.restarted'));
       await load();
     } catch (e) {
@@ -550,6 +658,12 @@ export default function AccountsPage() {
     // 国际版没有签到体系（上游对 global 账号直接过滤，不发请求）。
     // 这一行的「签到」按钮对国际版账号只会返回「已跳过」，属误导，故不显示。
     const canCheckin = (a.realm ?? 'cn') === 'cn';
+    // 今天已经签过：按钮转为「已签到」并禁用。
+    // 为什么要在界面上拦：腾讯对重复签到回 10001（幂等成功），所以点下去「看着
+    // 也能成功」——但每次都真打一次 RPC，还会在签到记录里堆一串「今日已签到」，
+    // 把真正的失败记录挤下去。后端另有一道拦截（不发请求），这里是让用户
+    // 一眼看出「不用再点了」，而不是点了之后才知道。
+    const checkinDone = a.checkin_today != null;
     // 本面板改名停用（issue #21）：账号已完全退出账号池，签到等任务也随之停掉，
     // 所以隐藏其它操作（它们对这个号已无意义）。
     const paused = a.disabled_by_panel === true;
@@ -578,19 +692,55 @@ export default function AccountsPage() {
             某个号在拖后腿（一直失败、触发风控）时，先停用它比删掉更合适
             （删除会丢凭证、只能重新扫码；停用是可逆的）。 */}
         {(!off || viaBit) && canCheckin && (
-          <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.checkin')} disabled={busy}
-            onClick={() => run(a.file, () => accountApi.checkin(a.file), t('accounts.opDone'))}>
-            <Gift className="h-3.5 w-3.5" />
+          <Button
+            variant="ghost"
+            size="icon"
+            className={
+              'h-7 w-7 rounded-md ' +
+              (checkinDone
+                ? 'text-emerald-600 hover:text-emerald-600 disabled:opacity-100 dark:text-emerald-400'
+                : '')
+            }
+            title={
+              checkinDone
+                ? t('accounts.checkinDoneTitle', {at: fmtDateTime(a.checkin_today as number)})
+                : t('accounts.checkin')
+            }
+            disabled={busy || checkinDone}
+            onClick={() => run(a.file, () => accountApi.checkin(a.file, groupId),
+                               t('accounts.opDone'))}
+          >
+            {checkinDone ? <Check className="h-3.5 w-3.5" /> : <Gift className="h-3.5 w-3.5" />}
+          </Button>
+        )}
+        {/* 活动任务（单账号）：与「任务」页的一键执行是同一套（调用上游
+            task_runner.py），区别是只对这一个账号跑 —— 池子里某个号想单独
+            补一轮任务时，不必把全部账号再跑一遍。国际版不适用 CN 任务中心
+            （脚本自己会 skip），所以与签到按钮同一个可见条件。
+            分组账号暂不在这里跑任务（任务脚本目前只覆盖默认分组的目录，
+            见 server/services/taskrun.py），所以非默认分组下不显示这个按钮。 */}
+        {(!off || viaBit) && canCheckin && groupId == null && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 rounded-md"
+            title={t('accounts.taskRun')}
+            disabled={busy}
+            onClick={() => setTaskTarget(a)}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
           </Button>
         )}
         {(!off || viaBit) && (
           <>
             <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.test')} disabled={busy}
-              onClick={() => run(a.file, () => accountApi.test(a.file), t('accounts.testDone'))}>
+              onClick={() => run(a.file, () => accountApi.test(a.file, groupId),
+                                 t('accounts.testDone'))}>
               <Zap className="h-3.5 w-3.5" />
             </Button>
             <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.refreshToken')} disabled={busy}
-              onClick={() => run(a.file, () => accountApi.refresh(a.file), t('accounts.refreshDone'))}>
+              onClick={() => run(a.file, () => accountApi.refresh(a.file, groupId),
+                                 t('accounts.refreshDone'))}>
               <KeyRound className="h-3.5 w-3.5" />
             </Button>
           </>
@@ -603,7 +753,7 @@ export default function AccountsPage() {
             destructive
             onConfirm={() => run(
               a.file,
-              () => accountApi.clearCooling(a.file),
+              () => accountApi.clearCooling(a.file, groupId),
               t('accounts.forceClearCoolingDone'),
               true,
             )}
@@ -620,6 +770,21 @@ export default function AccountsPage() {
             }
           />
         )}
+        {/* 移动到分组（多账号池）：把账号文件转移到另一个分组——凭证一个
+            字节不改。只有存在「别的分组」时才显示；能不能收由后端判（目标
+            没有本地账号目录会 409，弹窗里直接禁掉那些选项）。 */}
+        {isAdmin && groups.filter((g) => !g.is_default).length > 0 && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 rounded-md"
+            title={t('accounts.move')}
+            disabled={busy}
+            onClick={() => setMoveTarget(a)}
+          >
+            <FolderInput className="h-3.5 w-3.5" />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon"
@@ -631,7 +796,7 @@ export default function AccountsPage() {
           disabled={busy}
           onClick={() => run(
             a.file,
-            () => accountApi.setDisabled(a.file, !off),
+            () => accountApi.setDisabled(a.file, !off, groupId),
             // 文案如实反映用的是哪种机制：状态位停用后任务照常，改名停用则全停。
             off ? t('accounts.enabled')
                 : (viaBit ? t('accounts.manualDisabled') : t('accounts.disabled')),
@@ -644,7 +809,8 @@ export default function AccountsPage() {
           description={t('accounts.deleteDesc')}
           confirmText={t('accounts.delete')}
           destructive
-          onConfirm={() => run(a.file, () => accountApi.remove(a.file), t('accounts.deleted'))}
+          onConfirm={() => run(a.file, () => accountApi.remove(a.file, groupId),
+                               t('accounts.deleted'))}
           trigger={
             <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md text-red-500 hover:text-red-600" title={t('accounts.delete')}>
               <Trash2 className="h-3.5 w-3.5" />
@@ -716,16 +882,30 @@ export default function AccountsPage() {
             {/* 「全部签到」仅国内版显示：国际版**没有签到体系**（上游调度器对
                 global 账号直接过滤，不发请求）。显示一个按下去只会得到「已跳过」
                 的按钮是误导，直接不给。 */}
+            {/* 「全部签到」反映当天状态：
+                · 还有待签的 → 文案回到「全部签到」，并带上待签数（不用点进去数）
+                · 今天都签过了 → 文案变「今日已签」并禁用。禁用比「点了提示已签到」
+                  更好：重复点击本来就不该发生，让按钮自己说出原因，比点完再报错省一次往返。
+                判据 pendingCheckin 与每行签到按钮的可见条件一致，不会出现
+                「按钮说还有 1 个、列表里却找不到那个号」的矛盾。 */}
             {isAdmin && realm === 'cn' && (
               <Button
                 size="sm"
                 variant="outline"
                 className="rounded-full"
                 onClick={checkinAll}
-                disabled={checkinAllBusy || !visible.length}
+                disabled={checkinAllBusy || pendingCheckin === 0}
+                title={
+                  pendingCheckin === 0
+                    ? t('accounts.checkinAllNoneTitle')
+                    : t('accounts.checkinAllTitle', {n: pendingCheckin})
+                }
               >
                 <CalendarCheck className={checkinAllBusy ? 'animate-pulse' : ''} />
-                {t('accounts.checkinAll')}
+                {pendingCheckin === 0 ? t('accounts.checkinAllNone') : t('accounts.checkinAll')}
+                {pendingCheckin > 0 && (
+                  <span className="tabular-nums opacity-70">{pendingCheckin}</span>
+                )}
               </Button>
             )}
             {isAdmin && (
@@ -737,6 +917,83 @@ export default function AccountsPage() {
           </>
         }
       />
+
+      {/* 账号分组（多账号池）：默认分组 = 升级前那套（环境变量 / 上游
+          config.json）；「添加分组」只填名称即可（地址默认沿用默认分组的、
+          账号目录自动带出建议路径，其余字段到「设置 → 上游」再调）。
+          密钥绑定哪个分组，请求就走那一组的接入点。 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          variant={groupId == null ? 'default' : 'outline'}
+          size="sm"
+          className="rounded-full"
+          onClick={() => setGroupId(null)}
+        >
+          {t('accounts.groupDefault')}
+        </Button>
+        {groups
+          .filter((g) => !g.is_default && g.id != null)
+          .map((g) => (
+            <Button
+              key={g.id}
+              variant={groupId === g.id ? 'default' : 'outline'}
+              size="sm"
+              className="rounded-full"
+              onClick={() => setGroupId(g.id as number)}
+            >
+              {g.name}
+              {!g.enabled ? t('accounts.groupDisabledSuffix') : ''}
+            </Button>
+          ))}
+        {isAdmin && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="rounded-full"
+            onClick={() => setGroupDialogOpen(true)}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            {t('accounts.groupAdd')}
+          </Button>
+        )}
+        {isAdmin && groupId != null && (
+          <ConfirmDialog
+            title={t('accounts.groupDeleteTitle', {name: groupInfo?.name || ''})}
+            description={t('accounts.groupDeleteDesc')}
+            confirmText={t('accounts.groupDelete')}
+            destructive
+            onConfirm={() => deleteGroup()}
+            trigger={
+              <Button variant="ghost" size="sm" className="rounded-full text-destructive">
+                <Trash2 className="h-3.5 w-3.5" />
+                {t('accounts.groupDelete')}
+              </Button>
+            }
+          />
+        )}
+      </div>
+      {groupInfo && !groupInfo.manageable && groupId != null && (
+        <p className="px-1 text-[11px] leading-4 text-muted-foreground">
+          {t('accounts.groupNoDir', {name: groupInfo.name})}
+        </p>
+      )}
+
+      {/* 分组和默认分组共用一套上游实例 → 这一组的账号不会被加载。不解释的话，
+          「未加载」看起来像坏了：用户会反复重扫码、重试（issue #94）。 */}
+      {sharedInstance && (
+        <div className="flex items-start gap-2.5 rounded-2xl bg-amber-500/10 px-3.5 py-3 ring-1 ring-amber-500/20">
+          <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <div className="min-w-0 space-y-1">
+            <div className="text-xs font-medium">{t('accounts.sharedInstanceTitle')}</div>
+            <p className="text-[11px] leading-4 text-muted-foreground">
+              {t('accounts.sharedInstanceHint')}
+            </p>
+            <Link href="/settings" className="inline-block text-[11px] text-blue-500 hover:underline">
+              {t('accounts.sharedInstanceAction')}
+            </Link>
+          </div>
+        </div>
+      )}
 
       <section className="overflow-hidden rounded-[20px] bg-muted">
         {/* 手机端：卡片列表。表格 6 列在窄屏需要横向滚动，读一行要来回拖，
@@ -875,12 +1132,39 @@ export default function AccountsPage() {
         </Link>
       </div>
 
-      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={load} />
+      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={load}
+                        upstreamId={groupId} />
+      <MoveAccountDialog
+        account={moveTarget}
+        open={moveTarget !== null}
+        onOpenChange={(open) => { if (!open) setMoveTarget(null); }}
+        groups={groups}
+        fromGroupId={groupId}
+        onMoved={load}
+      />
+      <UpstreamFormDialog
+        open={groupDialogOpen}
+        onOpenChange={setGroupDialogOpen}
+        editing={null}
+        defaultUpstream={groups.find((g) => g.is_default) ?? null}
+        simple
+        onSaved={(item) => {
+          if (item && item.id != null) setGroupId(item.id);
+          void load();
+        }}
+      />
       <AccountNoteDialog
         account={noteTarget}
         open={noteTarget !== null}
         onOpenChange={(open) => { if (!open) setNoteTarget(null); }}
         onSaved={load}
+        upstreamId={groupId}
+      />
+      <AccountTaskDialog
+        account={taskTarget}
+        open={taskTarget !== null}
+        onOpenChange={(open) => { if (!open) setTaskTarget(null); }}
+        onFinished={load}
       />
     </div>
   );
