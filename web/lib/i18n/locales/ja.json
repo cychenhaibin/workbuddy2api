@@ -36,6 +36,10 @@
     "forbidden": "権限がありません：現在のアカウントではこの操作を実行できません"
   },
   "nav": {
+    "groupOverview": "概要",
+    "groupOps": "運用",
+    "groupGovernance": "ガバナンス",
+    "sectionTabs": "ページ内ナビゲーション",
     "dashboard": "ダッシュボード",
     "accounts": "アカウント",
     "tasks": "タスク",
@@ -73,6 +77,9 @@
     "poolOverview": "アカウントプール概要",
     "managedAccounts": "管理中のアカウント",
     "systemSettings": "システム設定",
+    "dockLabel": "ドックの位置",
+    "dockFloating": "フローティング（ドラッグ可）",
+    "dockPinned": "下部に固定",
     "quickLinks": "クイックリンク",
     "uiReference": "UI リファレンス",
     "community": "LINUX DO コミュニティ",
@@ -98,6 +105,8 @@
   },
   "dock": {
     "tipTitle": "メニューバーの案内",
+    "tipDismiss": "了解",
+    "tipNext": "次へ",
     "desktop1": "メニューバーはここに移動しました。空白部分を長押しするとドラッグで位置を変更できます。",
     "desktop2": "右から2番目のボタンで、Tencent アカウントを QR コードですばやく追加できます。",
     "desktop3": "一番右のボタンで、個人設定とアカウント情報を開けます。",
@@ -105,6 +114,19 @@
     "mobile2": "メニューバーの空白部分を長押しすると、ドラッグで位置を変更できます。",
     "mobile3": "展開後、最後から2番目のボタンで Tencent アカウントをすばやく追加できます。",
     "mobile4": "展開後、一番最後のボタンで個人設定とアカウント情報を開けます。"
+  },
+  "palette": {
+    "title": "コマンドパレット",
+    "desc": "キーワードを入力して任意のページへ移動",
+    "placeholder": "ページを検索…",
+    "empty": "一致するページがありません",
+    "emptyHint": "「アカウント」「紅包」を試すか、パスを直接入力してください",
+    "trigger": "検索",
+    "triggerHint": "コマンドパレットを開く",
+    "hintMove": "選択",
+    "hintOpen": "開く",
+    "hintClose": "閉じる",
+    "results": "全 {n} 件"
   },
   "update": {
     "newVersion": "新しいバージョンがあります",
@@ -1045,7 +1067,11 @@
     "unpin": "固定を解除",
     "logTitle": "更新ログ",
     "logLines": "{n} 行",
-    "logEmpty": "ログはまだありません。更新を実行するとここに進捗がリアルタイム表示されます。"
+    "logEmpty": "ログはまだありません。更新を実行するとここに進捗がリアルタイム表示されます。",
+    "clearResult": "記録を消去",
+    "clearResultTitle": "前回の更新結果とログを消去しますか？",
+    "clearResultDesc": "消去されるのは前回の更新結果とログ（update.log）だけです。インストール済みのバージョン・アカウント・設定には影響しません。更新の実行中は消去できません。",
+    "cleared": "前回の更新記録を消去しました"
   },
   "settings": {
     "title": "設定",
@@ -1131,6 +1157,12 @@
     "savedManualStep": "設定を保存しましたが、手動での 1 ステップが必要です",
     "saved": "設定を保存しました",
     "applying": "上流へ自動適用しています…",
+    "applyRunning": "設定を適用しています…",
+    "applyRunningHint": "上流コンテナを再起動しています。その間、アカウント関連のデータが一時的に取得できない場合があります。",
+    "applyOk": "設定が反映されました",
+    "applyFailed": "上流の再読み込みに失敗しました",
+    "applyFailedHint": "設定は書き込まれましたが、上流コンテナを再起動できませんでした。ホスト側で docker compose restart wb2api を実行して反映してください。",
+    "applyDismiss": "閉じる",
     "jsonInvalid": "JSON の形式が正しくありません。括弧とカンマを確認してください",
     "jsonNotObject": "JSON オブジェクトである必要があります（例: { \"checkin_hours\": [9, 21] }）",
     "modelMapSaved": "モデルマッピングを保存しました",

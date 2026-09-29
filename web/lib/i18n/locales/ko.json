@@ -36,6 +36,10 @@
     "forbidden": "권한이 없습니다: 현재 계정으로는 이 작업을 수행할 수 없습니다"
   },
   "nav": {
+    "groupOverview": "개요",
+    "groupOps": "운영",
+    "groupGovernance": "거버넌스",
+    "sectionTabs": "페이지 내 탐색",
     "dashboard": "대시보드",
     "accounts": "계정",
     "tasks": "작업",
@@ -73,6 +77,9 @@
     "poolOverview": "계정 풀 개요",
     "managedAccounts": "관리 중인 계정",
     "systemSettings": "시스템 설정",
+    "dockLabel": "독 위치",
+    "dockFloating": "플로팅(드래그 가능)",
+    "dockPinned": "하단 고정",
     "quickLinks": "빠른 링크",
     "uiReference": "UI 참고",
     "community": "LINUX DO 커뮤니티",
@@ -98,6 +105,8 @@
   },
   "dock": {
     "tipTitle": "메뉴 바 안내",
+    "tipDismiss": "확인",
+    "tipNext": "다음",
     "desktop1": "메뉴 바가 이 위치로 이동했습니다. 빈 영역을 길게 눌러 드래그하면 위치를 바꿀 수 있습니다.",
     "desktop2": "오른쪽에서 두 번째 버튼으로 Tencent 계정을 QR 코드로 빠르게 추가할 수 있습니다.",
     "desktop3": "가장 오른쪽 버튼으로 개인 설정과 계정 정보를 열 수 있습니다.",
@@ -105,6 +114,19 @@
     "mobile2": "메뉴 바의 빈 영역을 길게 누르면 드래그로 위치를 바꿀 수 있습니다.",
     "mobile3": "펼친 뒤 마지막에서 두 번째 버튼으로 Tencent 계정을 빠르게 추가할 수 있습니다.",
     "mobile4": "펼친 뒤 마지막 버튼으로 개인 설정과 계정 정보를 열 수 있습니다."
+  },
+  "palette": {
+    "title": "명령 팔레트",
+    "desc": "키워드를 입력해 원하는 페이지로 이동합니다",
+    "placeholder": "페이지 검색…",
+    "empty": "일치하는 페이지가 없습니다",
+    "emptyHint": "「계정」「빨간 봉투」를 입력하거나 경로를 직접 입력해 보세요",
+    "trigger": "검색",
+    "triggerHint": "명령 팔레트 열기",
+    "hintMove": "선택",
+    "hintOpen": "열기",
+    "hintClose": "닫기",
+    "results": "총 {n}개"
   },
   "update": {
     "newVersion": "새 버전이 있습니다",
@@ -1045,7 +1067,11 @@
     "unpin": "고정 해제",
     "logTitle": "업데이트 로그",
     "logLines": "{n}줄",
-    "logEmpty": "로그가 없습니다. 업데이트를 실행하면 여기에 진행 상황이 실시간으로 표시됩니다."
+    "logEmpty": "로그가 없습니다. 업데이트를 실행하면 여기에 진행 상황이 실시간으로 표시됩니다.",
+    "clearResult": "기록 지우기",
+    "clearResultTitle": "이전 업데이트 결과와 로그를 지울까요?",
+    "clearResultDesc": "이전 업데이트 결과와 로그(update.log)만 삭제됩니다. 설치된 버전, 계정, 설정에는 영향이 없습니다. 업데이트가 실행 중일 때는 지울 수 없습니다.",
+    "cleared": "이전 업데이트 기록을 지웠습니다"
   },
   "settings": {
     "title": "설정",
@@ -1131,6 +1157,12 @@
     "savedManualStep": "설정을 저장했지만 수동으로 한 단계가 필요합니다",
     "saved": "설정을 저장했습니다",
     "applying": "업스트림에 자동 적용 중…",
+    "applyRunning": "설정을 적용하는 중…",
+    "applyRunningHint": "업스트림 컨테이너를 재시작하는 중입니다. 그동안 계정 관련 데이터를 잠시 읽지 못할 수 있습니다.",
+    "applyOk": "설정이 적용되었습니다",
+    "applyFailed": "업스트림 다시 불러오기 실패",
+    "applyFailedHint": "설정은 저장되었지만 업스트림 컨테이너를 재시작하지 못했습니다. 호스트에서 docker compose restart wb2api 를 실행해 적용하세요.",
+    "applyDismiss": "닫기",
     "jsonInvalid": "JSON 형식이 올바르지 않습니다. 괄호와 쉼표를 확인하세요",
     "jsonNotObject": "JSON 객체여야 합니다. 예: { \"checkin_hours\": [9, 21] }",
     "modelMapSaved": "모델 매핑을 저장했습니다",

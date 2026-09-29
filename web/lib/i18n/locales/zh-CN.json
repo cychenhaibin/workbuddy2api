@@ -36,6 +36,10 @@
     "forbidden": "权限不足：当前账号不能执行这个操作"
   },
   "nav": {
+    "groupOverview": "总览",
+    "groupOps": "运营",
+    "groupGovernance": "治理",
+    "sectionTabs": "页面内导航",
     "dashboard": "仪表盘",
     "accounts": "账号",
     "tasks": "任务",
@@ -73,6 +77,9 @@
     "poolOverview": "账号池概览",
     "managedAccounts": "受管账号",
     "systemSettings": "系统设置",
+    "dockLabel": "底栏位置",
+    "dockFloating": "悬浮（可拖动）",
+    "dockPinned": "固定底部",
     "quickLinks": "快速链接",
     "uiReference": "UI 参考",
     "community": "LINUX DO 社区",
@@ -98,6 +105,8 @@
   },
   "dock": {
     "tipTitle": "菜单栏引导",
+    "tipDismiss": "知道了",
+    "tipNext": "下一步",
     "desktop1": "菜单栏已调整至此处，长按空白区域可自定义拖动位置。",
     "desktop2": "右侧第二个按钮用于快速扫码添加腾讯账号。",
     "desktop3": "右侧第一个按钮用于访问个人设置与账户信息。",
@@ -105,6 +114,19 @@
     "mobile2": "长按菜单栏空白区域可自定义拖动位置。",
     "mobile3": "展开后，倒数第二个按钮用于快速添加腾讯账号。",
     "mobile4": "展开后，倒数第一个按钮用于访问个人设置与账户信息。"
+  },
+  "palette": {
+    "title": "命令面板",
+    "desc": "输入关键字，跳转到任意页面",
+    "placeholder": "搜索页面…",
+    "empty": "没有匹配的页面",
+    "emptyHint": "试试「账号」「红包」，或直接输入路径",
+    "trigger": "搜索",
+    "triggerHint": "打开命令面板",
+    "hintMove": "选择",
+    "hintOpen": "打开",
+    "hintClose": "关闭",
+    "results": "共 {n} 项"
   },
   "update": {
     "newVersion": "发现新版本可更新",
@@ -1045,7 +1067,11 @@
     "unpin": "取消固定",
     "logTitle": "更新日志",
     "logLines": "{n} 行",
-    "logEmpty": "暂无日志。执行更新后这里会实时显示进度。"
+    "logEmpty": "暂无日志。执行更新后这里会实时显示进度。",
+    "clearResult": "清除记录",
+    "clearResultTitle": "清除上次更新的结果与日志？",
+    "clearResultDesc": "只会删掉上次更新的结果与日志（update.log）。已装版本、账号与配置不受影响；更新进行中不能清除。",
+    "cleared": "已清除上次更新的记录"
   },
   "settings": {
     "title": "设置",
@@ -1131,6 +1157,12 @@
     "savedManualStep": "设置已保存，但需要你手动一步",
     "saved": "设置已保存",
     "applying": "正在自动应用到上游…",
+    "applyRunning": "正在应用配置…",
+    "applyRunningHint": "上游容器正在重启，期间账号相关的数据可能暂时读不到。",
+    "applyOk": "配置已生效",
+    "applyFailed": "上游重载失败",
+    "applyFailedHint": "配置已经写入，但上游容器没能重启。请在宿主机执行 docker compose restart wb2api 使其生效。",
+    "applyDismiss": "关闭提示",
     "jsonInvalid": "JSON 格式有误，请检查括号与逗号",
     "jsonNotObject": "需要是一个 JSON 对象，例如 { \"checkin_hours\": [9, 21] }",
     "modelMapSaved": "模型映射已保存",
