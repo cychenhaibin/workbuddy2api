@@ -3,22 +3,19 @@ import {BASE_PATH} from './base-path';
 import {t, tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
-  UpstreamEndpoint,
   Account,
-  CheckinLogPage,
-  CreditExpiry,
-  CreditsMeta,
   AccountsResponse,
   ApiKey,
-  ClaimInfo,
-  CreatedRedPacket,
-  DrawResult,
-  RedPacket,
-  RedPacketDetail,
-  RedPacketKind,
-  RedPacketMode,
   ApiToken,
+  AuditLogPage,
+  Changelog,
+  CheckinLogPage,
+  ClaimInfo,
   CreatedApiToken,
+  CreatedRedPacket,
+  CreditExpiry,
+  CreditsMeta,
+  DrawResult,
   IpAccessLog,
   IpRule,
   KeyExportResult,
@@ -26,24 +23,32 @@ import type {
   KeyImportResult,
   KeyImportStatus,
   Me,
-  AuditLogPage,
   ModelCatalog,
   ModelListResponse,
   Page,
+  PgSyncConfig,
+  PgSyncConfigResponse,
+  PgSyncStatus,
+  PgSyncTestResult,
   PlaygroundModels,
+  RedPacket,
+  RedPacketDetail,
+  RedPacketKind,
+  RedPacketMode,
   ReloadState,
   RequestLog,
-  Changelog,
   SecurityConfig,
   StatsSummary,
   TaskLogResponse,
   TaskRunStatus,
+  UpdateCheck,
+  UpdateStatus,
   UpstreamConfig,
+  UpstreamEndpoint,
   UpstreamStats,
   UpstreamStatus,
   UsageBreakdown,
-  UpdateCheck,
-  UpdateStatus,
+  UsageHourPoint,
   UsagePoint,
   UserItem,
   Versions,
@@ -495,6 +500,12 @@ export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
   daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  /**
+   * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
+   * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
+   */
+  hourly: (day?: string, realm?: Realm) =>
+    get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
   byModel: (days = 30, realm?: Realm) =>
     get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
   byKey: (days = 30, realm?: Realm) =>
@@ -578,4 +589,22 @@ export const systemApi = {
     del<{ok: boolean; message: string}>('/api/system/update-status'),
   /** 更新日志（解析仓库根目录 CHANGELOG.md，离线可用） */
   changelog: () => get<Changelog>('/api/system/changelog'),
+};
+
+/* ── PostgreSQL 异地备份（设置 → 数据备份）────────────── */
+export const pgSyncApi = {
+  config: () => get<PgSyncConfigResponse>('/api/settings/pg-sync'),
+  /** 保存连接配置；password 传掩码或空串表示沿用已保存的值 */
+  save: (body: Partial<PgSyncConfig>) =>
+    post<{config: PgSyncConfig}>('/api/settings/pg-sync', body),
+  /** 探测连通性。表单里刚填的值优先，没填的字段回落到已保存的配置 */
+  test: (body: Partial<PgSyncConfig>) =>
+    post<PgSyncTestResult>('/api/settings/pg-sync/test', body),
+  /** 把本地数据全量推到 PostgreSQL（只读本地，不会改动它） */
+  exportData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/export'),
+  /** 从 PostgreSQL 拉回数据。**会覆盖本地数据**，前端必须先二次确认 */
+  importData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/import'),
+  status: () => get<PgSyncStatus>('/api/settings/pg-sync/status'),
 };
