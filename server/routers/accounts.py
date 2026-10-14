@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import io
 import json
 import logging
 import shutil
 import time
+import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 
 from .. import config, db, security, upstreamsvc
 from ..services import (
@@ -20,6 +23,210 @@ from ..services.realm import realm_of, supports_checkin
 logger = logging.getLogger('workbuddy.accounts')
 
 router = APIRouter(prefix='/api', tags=['accounts'])
+
+_ACCOUNT_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _export_account_name(path: Path) -> str:
+    """Return a JSON filename that can be uploaded again."""
+    return path.name[:-len('.disabled')] if path.name.endswith('.disabled') else path.name
+
+
+class _InvalidUploadProxy(ValueError):
+    pass
+
+
+def _uploaded_account(raw: object, filename: str) -> dict:
+    """Normalize supported exported account JSON into ``write_auth_file`` input."""
+    if not isinstance(raw, dict):
+        raise ValueError('账号条目必须是对象')
+
+    account = raw.get('account') if isinstance(raw.get('account'), dict) else raw
+    auth = raw.get('auth') if isinstance(raw.get('auth'), dict) else raw
+
+    def value(*keys: str) -> object:
+        for source in (auth, account, raw):
+            for key in keys:
+                if source.get(key) not in (None, ''):
+                    return source[key]
+        return ''
+
+    uid = str(value('uid', 'user_id')).strip()
+    access_token = str(value('accessToken', 'access_token')).strip()
+    if not uid:
+        raise ValueError('缺少 uid')
+    if not access_token:
+        raise ValueError('缺少 accessToken')
+
+    absolute_expiry = value('expiresAt', 'expires_at')
+    duration_expiry = value('expiresIn', 'expires_in')
+    try:
+        if absolute_expiry not in (None, ''):
+            expires_at = int(absolute_expiry)
+        elif duration_expiry in (None, ''):
+            # Some exports only preserve opaque tokens. Zero means unknown; fabricating
+            # an expiry would make scheduling and the account page report false data.
+            expires_at = 0
+        else:
+            # Tencent's expiresIn is a duration, unlike expiresAt which is an epoch.
+            expires_at = int(time.time()) + int(duration_expiry)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('expiresAt 必须是数字') from exc
+    if expires_at < 0:
+        raise ValueError('expiresAt 必须是非负数字')
+
+    return {
+        'uid': uid,
+        'access_token': access_token,
+        'refresh_token': str(value('refreshToken', 'refresh_token') or ''),
+        'expires_at': expires_at,
+        'domain': str(value('domain') or ''),
+        'realm': str(value('realm') or ''),
+        'enterprise_id': str(value('enterpriseId', 'enterprise_id') or ''),
+        'nickname': str(value('nickname', 'name') or ''),
+        'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(value('proxy') or ''),
+        '_filename': filename,
+    }
+
+
+def _uploaded_entries(raw: object) -> list[object]:
+    """Expand common single-account and multi-account export shapes."""
+    if isinstance(raw, dict) and isinstance(raw.get('accounts'), list):
+        entries = raw['accounts']
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        entries = [raw]
+    if not entries:
+        raise ValueError('JSON 中没有账号条目')
+    return entries
+
+
+@router.get('/accounts/export')
+def export_accounts(
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_session_admin),
+) -> StreamingResponse:
+    """Export one JSON file per account from the selected group."""
+    group = _group(upstream_id)
+    auth_dir = _require_dir(group)
+    base = auth_dir.resolve()
+    files = sorted(auth_dir.glob('workbuddy*.json'))
+    files += sorted(auth_dir.glob('workbuddy*.json.disabled'))
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, mode='w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            try:
+                if not path.is_file() or path.resolve().parent != base:
+                    continue
+                raw = path.read_bytes()
+                json.loads(raw.decode('utf-8'))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                logger.warning('跳过无法导出的账号文件 file=%s', path.name)
+                continue
+            archive.writestr(_export_account_name(path), raw)
+
+    payload.seek(0)
+    security.audit(user, 'accounts.export', group['name'],
+                   f'导出 {len(files)} 个账号文件（含凭据）')
+    return StreamingResponse(
+        payload,
+        media_type='application/zip',
+        headers={
+            'Content-Disposition': 'attachment; filename="accounts.zip"',
+            # 包里是账号凭据：明确不许任何中间层或浏览器缓存它（审计留痕是另一半）。
+            'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+            'Pragma': 'no-cache',
+        },
+    )
+
+
+@router.post('/accounts/upload')
+async def upload_accounts(
+    files: list[UploadFile] = File(...),
+    upstream_id: int | None = Query(None),
+    overwrite: bool = Query(False),
+    user: dict = Depends(security.require_session_admin),
+) -> dict:
+    """Import one or more account JSON files, preserving the existing account flow."""
+    group = _group(upstream_id)
+    auth_dir = _require_dir(group)
+    uploaded: list[dict] = []
+    added: list[dict] = []
+    overwritten: list[dict] = []
+    rejected: list[dict] = []
+    failed: list[dict] = []
+
+    for upload in files:
+        name = upload.filename or '未命名文件'
+        try:
+            if not name.lower().endswith('.json'):
+                raise ValueError('只支持 .json 文件')
+            content = await upload.read(_ACCOUNT_UPLOAD_MAX_BYTES + 1)
+            if len(content) > _ACCOUNT_UPLOAD_MAX_BYTES:
+                raise ValueError('文件不能超过 2 MB')
+            raw = json.loads(content.decode('utf-8-sig'))
+            for entry in _uploaded_entries(raw):
+                try:
+                    account = _uploaded_account(entry, name)
+                    if account['proxy']:
+                        try:
+                            config.account_proxy({'proxy': account['proxy']})
+                        except ValueError as exc:
+                            raise _InvalidUploadProxy(str(exc)) from exc
+                    filename, existed = tencent.write_auth_file(
+                        account, auth_dir, allow_overwrite=overwrite)
+                    # Preserve per-account metadata that write_auth_file intentionally does not
+                    # accept from the login flow.
+                    path = auth_dir / filename
+                    saved = json.loads(path.read_text(encoding='utf-8'))
+                    if account['device_token']:
+                        saved['device_token'] = account['device_token']
+                    if account['proxy']:
+                        saved['proxy'] = account['proxy']
+                    tencent._atomic_write_json(path, saved)
+                    reload.request_reload_or_restart(account['uid'], upstream=_reload_target(group))
+                    item = {'file': filename, 'uid': account['uid'], 'updated': existed}
+                    uploaded.append(item)
+                    (overwritten if existed else added).append(item)
+                except tencent.AccountExistsError as exc:
+                    rejected.append({'file': name, 'uid': exc.uid, 'message': '账号已存在，未覆盖'})
+                except _InvalidUploadProxy as exc:
+                    logger.info('账号线路校验失败 file=%s reason=%s', name, str(exc))
+                    rejected.append({'file': name, 'message': '账号线路无效'})
+                except ValueError as exc:
+                    logger.info('账号条目校验失败 file=%s reason=%s', name, str(exc))
+                    rejected.append({'file': name, 'message': '账号条目无效'})
+                except Exception:
+                    logger.exception('账号条目导入失败 file=%s', name)
+                    failed.append({'file': name, 'message': '账号导入失败'})
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.info('账号文件格式校验失败 file=%s reason=%s', name, type(exc).__name__)
+            failed.append({'file': name, 'message': '文件格式无效'})
+        except ValueError as exc:
+            if str(exc) == '文件不能超过 2 MB':
+                failed.append({'file': name, 'message': '文件不能超过 2 MB'})
+            else:
+                logger.info('账号文件校验失败 file=%s reason=%s', name, str(exc))
+                failed.append({'file': name, 'message': '文件内容无效'})
+        except Exception:
+            logger.exception('账号文件导入失败 file=%s', name)
+            failed.append({'file': name, 'message': '文件导入失败'})
+
+    if uploaded or rejected:
+        security.audit(user, 'accounts.import', group['name'],
+                       f'新增 {len(added)} / 覆盖 {len(overwritten)} / '
+                       f'拒绝 {len(rejected)} / 失败 {len(failed)}')
+    return {
+        'ok': not failed and not rejected,
+        'uploaded': uploaded,
+        'added': added,
+        'overwritten': overwritten,
+        'rejected': rejected,
+        'failed': failed,
+    }
 
 # ── 服务端侧的授权轮询（用户反馈：被遮挡窗口的定时器节流）──────────────
 #
@@ -34,7 +241,13 @@ _LOGIN_POLL_MAX = 300.0          # 后台最多盯 5 分钟，之后当过期处
 _LOGIN_RESULT_TTL = 900.0        # 终态结果留 15 分钟，够前端被节流后回来取
 _login_polls: dict[str, dict] = {}       # state → 响应（终态含成功结果）
 _login_tasks: dict[str, asyncio.Task] = {}
-_login_regions: dict[str, str] = {}      # state → 国际版地区（可能晚于 auth/start 到达）
+_login_regions: dict[str, str] = {}
+# `_login_ready`：授权已经拿到、但**落盘失败**时把那份结果记下来（issue #146）。
+# 为什么要记：落盘失败后前端会继续轮询同一个 state 重试落盘，而腾讯那边这次授权
+# 可能已经不再报 ready —— 于是前端只拿到「等待中」，永远等下去（用户看到的就是
+# 一直 waiting，日志里却在刷 200 OK）。记下结果后，重试完全走本端：重新落盘，
+# 成功了就完成，失败则把「去修目录权限」那条可执行提示原样报给前端。
+_login_ready: dict[str, tuple[dict, str, str, float]] = {}      # state → 国际版地区（可能晚于 auth/start 到达）
 _login_owner: dict[str, str] = {}        # state → 发起人，用于收掉同一用户的旧轮询
 
 
@@ -74,6 +287,10 @@ def _prune_login_polls() -> None:
         _login_tasks.pop(st, None)
         _login_regions.pop(st, None)
         _login_owner.pop(st, None)
+    # 「等重试落盘」的备忘也要按同样的 TTL 清（它没有 _login_polls 条目，
+    # 上面那轮扫不到它）
+    for st in [k for k, v in _login_ready.items() if now - float(v[3]) > _LOGIN_RESULT_TTL]:
+        _login_ready.pop(st, None)
 
 
 def _today_start() -> int:
@@ -388,6 +605,13 @@ async def auth_poll(
     r = None
     if realm is not None:
         r = 'global' if str(realm).strip().lower() == 'global' else 'cn'
+    ready = _login_ready.get(state)
+    if ready is not None:
+        # 上次已经拿到授权、只是没落盘：直接重试落盘（不再问腾讯——那边可能已经
+        # 不再报 ready，继续问只会让用户一直「等待中」）。
+        memo_result, memo_realm, memo_msg = ready[0], ready[1], ready[2]
+        return _save_and_finish(memo_result, memo_realm, memo_msg, state, group=group)
+
     result = await tencent.poll_login(state, r)
     if result.get('status') != 'ready':
         return result
@@ -435,8 +659,11 @@ async def auth_poll(
     # 落位，否则「签到成功但标记没写」的窗口里重试仍会重跑一次。
     _mark_provisioned(state)
     creditsvc.invalidate(str(result.get('uid', '')))
-    return _save_and_finish(result, realm_of_result, region_msg, state,
-                            group=group)
+    # 落盘前记下这份结果：万一落盘失败，重试要能只重做落盘（见 _login_ready 注释）
+    _login_ready[state] = (result, realm_of_result, region_msg, time.time())
+    out = _save_and_finish(result, realm_of_result, region_msg, state, group=group)
+    _login_ready.pop(state, None)
+    return out
 
 
 def _mark_provisioned(state: str) -> None:
@@ -665,17 +892,23 @@ def _auth_dict(raw: dict) -> dict:
     device_token 是**每号**的设备风控 token（auth 文件顶层 device_token 键，
     与 workbuddy2api 的解析位置一致）；缺省留空，由 realm.device_token_for
     回退到上游 config 的全局值或文件。
+
+    `nickname` / `proxy_session` 只为**旧版线路地址里的 `{account}` 会话模板**带上
+    （`config.route_session_name` 要拿它算会话名）：会话名决定住宅代理的出口 IP，
+    不带就等于每次按 uid 现算，界面显示的会话名与真实出口对不上。
     """
     acct = raw.get('account') or {}
     auth = raw.get('auth') or {}
     return {
         'access_token': auth.get('accessToken', ''),
         'uid': acct.get('uid', ''),
+        'nickname': str(acct.get('nickname') or ''),
         'enterprise_id': acct.get('enterpriseId', ''),
         'domain': auth.get('domain', ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
         'proxy': str(raw.get('proxy') or ''),
+        'proxy_session': str(raw.get('proxy_session') or ''),
     }
 
 
@@ -779,6 +1012,45 @@ async def account_credits(
         'cache_age': age,
         'expiries': expiries,
     }
+
+
+def _local_uids() -> set[str]:
+    """本机**所有分组**当前存在的账号 uid（含被临时禁用的）。
+
+    快照按 uid 登记、不分分组，所以判断「这个 uid 还在不在」也要跨分组找。
+    被禁用的账号算存在：那只是把文件改名为 `.disabled`，随时可以再启用
+    （与 `wb2api.list_auth_accounts` 的口径一致）。
+    """
+    found: set[str] = set()
+    for group in upstreamsvc.list_upstreams():
+        directory = _group_dir(group)
+        if directory is None:
+            continue
+        for account in wb2api.list_auth_accounts(directory):
+            uid = str(account.get('uid') or '').strip()
+            if uid:
+                found.add(uid)
+    return found
+
+
+@router.get('/accounts/credits-snapshot')
+def credits_snapshot(user: dict = Depends(security.current_user)) -> dict:
+    """已登记的积分快照（只读）。
+
+    给外部工具/对账用：**不触发任何上游查询**，只回面板已经记录下来的余额与登记
+    时刻。读接口，只读令牌也能调；请把数字按「已登记」使用，不要当实时余额。
+
+    快照**跨全部分组**（它按 uid 登记，不分组的），每行因此带一个 `known`：
+    该 uid 现在是否还对应一个本机账号。账号删掉之后，快照里那份历史记录不会
+    跟着消失 —— 对账脚本可以据 `known=false` 把它排除，或反过来当作
+    「这个账号曾经存在」的凭据。
+    """
+    payload = creditsvc.snapshot_entries()
+    known = _local_uids()
+    for row in payload['accounts']:
+        row['known'] = row['uid'] in known
+    payload['known_count'] = sum(1 for row in payload['accounts'] if row['known'])
+    return payload
 
 
 @router.post('/accounts/refresh-credits')

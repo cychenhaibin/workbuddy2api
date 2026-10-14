@@ -35,6 +35,15 @@ from .realm import (
     supports_checkin,
 )
 
+from .errtext import err_text
+
+class AccountExistsError(ValueError):
+    """Raised when an import attempts to replace an existing account without consent."""
+
+    def __init__(self, uid: str) -> None:
+        self.uid = uid
+        super().__init__('账号已存在')
+
 # 扫码 state 缓存：state -> (登记时间, 发起时的版本)。
 # 记 realm 是为了在回调时校验一致——若用户先开国内版的码、又切到国际版再轮询，
 # 不校验就会把国际版的 token 写进国内版的会话流程（上游 validateRealmMatch 同此意图）。
@@ -282,7 +291,7 @@ def update_auth_tokens(filename: str, fields: dict,
     except FileNotFoundError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'账号文件无法解析，已放弃写入：{exc}') from exc
+        raise ValueError(f'账号文件无法解析，已放弃写入：{err_text(exc)}') from exc
     if not isinstance(raw, dict):
         raise ValueError('账号文件格式异常，已放弃写入')
 
@@ -321,7 +330,8 @@ def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
     return (auth_dir or config.AUTH_DIR) / filename
 
 
-def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
+def write_auth_file(account: dict, auth_dir: Path | None = None,
+                    *, allow_overwrite: bool = True) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
 
     realm 写在 `auth` 对象内（与 domain 同级）——上游就是从这里读的。
@@ -345,7 +355,12 @@ def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, b
     base = auth_dir or config.AUTH_DIR
     base.mkdir(parents=True, exist_ok=True)
     target = base / f'workbuddy-{uid}.json'
+    disabled_target = base / f'{target.name}.disabled'
+    if not target.exists() and disabled_target.exists():
+        target = disabled_target
     existed = target.exists()
+    if existed and not allow_overwrite:
+        raise AccountExistsError(uid)
     domain = account.get('domain', '')
     resolved = resolve_realm(account.get('realm'), domain)
 
@@ -441,7 +456,7 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
         async with _account_http_client(auth) as client:
             resp = await client.post(url, headers=headers)
     except Exception as exc:  # noqa: BLE001
-        return False, f'刷新异常: {exc}', {}
+        return False, f'刷新异常: {err_text(exc)}', {}
 
     if resp.status_code >= 400:
         # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。
@@ -510,7 +525,7 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
             return 10001, '今日已签到'
         return code, f'签到返回 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return -1, f'签到异常: {exc}'
+        return -1, f'签到异常: {err_text(exc)}'
 
 
 async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list[dict]]:
@@ -589,7 +604,7 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         expiries.sort(key=lambda e: e['at'])
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
-        return False, None, f'查询异常: {exc}', []
+        return False, None, f'查询异常: {err_text(exc)}', []
 
 
 async def fetch_models(auth: dict) -> tuple[bool, list | str]:
@@ -646,7 +661,7 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
                         return body, ''
             return None, f'code={last_code}'
         except Exception as exc:  # noqa: BLE001
-            return None, f'异常: {exc}'
+            return None, f'异常: {err_text(exc)}'
 
     # 两路并发：串行会把模型中心的等待时间翻倍，而两路互不依赖。
     ent_res, v3_res = await asyncio.gather(
@@ -993,7 +1008,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                     return False, '上游未返回任何数据'
         return False, '所有候选路径均不可用'
     except Exception as exc:  # noqa: BLE001
-        return False, f'请求异常: {exc}'
+        return False, f'请求异常: {err_text(exc)}'
 
 
 def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
@@ -1095,7 +1110,7 @@ async def registration_status(auth: dict) -> tuple[bool, str]:
             return False, '尚未完成地区注册'
         return False, f'注册状态未知 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return False, f'查询注册状态异常: {exc}'
+        return False, f'查询注册状态异常: {err_text(exc)}'
 
 
 async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
@@ -1145,7 +1160,7 @@ async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
             return True, f'地区已提交（{code_upper}）'
         return False, f'提交地区失败 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return False, f'提交地区异常: {exc}'
+        return False, f'提交地区异常: {err_text(exc)}'
 
 
 async def _region_fields(ios2: str, auth: dict | None = None) -> tuple[str, str, str]:
@@ -1209,4 +1224,4 @@ async def claim_trial(auth: dict) -> tuple[bool, str]:
             return True, 'trial 此前已领取（幂等）'
         return False, f'领取 trial 失败 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return False, f'领取 trial 异常: {exc}'
+        return False, f'领取 trial 异常: {err_text(exc)}'

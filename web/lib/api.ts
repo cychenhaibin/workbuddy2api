@@ -11,6 +11,12 @@ import type {
   Changelog,
   CheckinLogPage,
   ClaimInfo,
+  ProxyProbe,
+  ProxyPool,
+  RouteBindingsResponse,
+  ProxyRoute,
+  ProxyRouteList,
+  ProxySettings,
   CreatedApiToken,
   CreatedRedPacket,
   CreditExpiry,
@@ -156,6 +162,27 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  exportZip: async (upstreamId?: number | null) => {
+    const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+  upload: (files: File[], upstreamId?: number | null, overwrite = false) => {
+    const body = new FormData();
+    files.forEach((file) => body.append('files', file, file.name));
+    const group = groupQs(upstreamId);
+    const separator = group ? '&' : '?';
+    return http.post<{
+      ok: boolean;
+      uploaded: Array<{file: string; uid: string; updated: boolean}>;
+      added: Array<{file: string; uid: string; updated: boolean}>;
+      overwritten: Array<{file: string; uid: string; updated: boolean}>;
+      rejected: Array<{file: string; uid?: string; message: string}>;
+      failed: Array<{file: string; message: string}>;
+    }>('/api/accounts/upload' + group + separator + `overwrite=${overwrite ? 'true' : 'false'}`, body)
+      .then((r) => r.data);
+  },
   /**
    * 发起扫码登录；realm 决定国内版 / 国际版端点。
    *
@@ -541,6 +568,45 @@ export const securityApi = {
 };
 
 /* ── 上游配置 / 用户 ───────────────────────────────── */
+/** 代理线路与全局出口代理（设置 → 代理）。凭据一律走服务端的脱敏口径。 */
+export const proxyApi = {
+  routes: (upstreamId?: number | null) =>
+    get<ProxyRouteList>('/api/proxy-routes' + groupQs(upstreamId)),
+  create: (name: string, url: string, weight?: number, enabled?: boolean) =>
+    post<ProxyRoute>('/api/proxy-routes', {name, url, weight, enabled}),
+  update: (name: string, body: {url?: string; new_name?: string; weight?: number},
+           upstreamId?: number | null) =>
+    put<ProxyRoute>(`/api/proxy-routes/${encodeURIComponent(name)}` + groupQs(upstreamId), body),
+  remove: (name: string, force: boolean, upstreamId?: number | null) => {
+    // 查询串自己拼：groupQs 只负责分组参数，force 是这条接口特有的
+    const qs = new URLSearchParams();
+    if (upstreamId) qs.set('upstream_id', String(upstreamId));
+    if (force) qs.set('force', '1');
+    const query = qs.toString();
+    return del<{name: string; bound_cleared: number}>(
+      `/api/proxy-routes/${encodeURIComponent(name)}${query ? `?${query}` : ''}`);
+  },
+  import: (text: string) =>
+    post<{imported: number; problems: string[]}>('/api/proxy-routes/import', {text}),
+  probe: (name: string) => post<ProxyProbe>('/api/proxy-routes/probe', {name}),
+  /** 绑定管理：全部账号 + 各自绑定的线路（空 = 跟随池策略） */
+  bindings: (upstreamId?: number | null) =>
+    get<RouteBindingsResponse>('/api/proxy-routes/bindings' + groupQs(upstreamId)),
+  /** 自动分配 N 台账号到这条线路（未绑定的优先，挑完仍可手动增删） */
+  autoAssign: (name: string, count: number, upstreamId?: number | null) =>
+    post<{updated: number; requested: number; candidates: number; unbound_left: number}>(
+      `/api/proxy-routes/${encodeURIComponent(name)}/auto-assign` + groupQs(upstreamId),
+      {count}),
+  /** 池配置：开关 / 策略 / 间隔 */
+  savePool: (body: {enabled?: boolean; strategy?: string; interval_seconds?: number}) =>
+    put<ProxyPool>('/api/settings/proxy-pool', body),
+  settings: () => get<ProxySettings>('/api/settings/proxy'),
+  saveSettings: (body: {http_proxy?: string; update_proxy?: string;
+                           global_proxy_enabled?: boolean}) =>
+    put<ProxySettings>('/api/settings/proxy', body),
+  probeGlobal: () => post<ProxyProbe>('/api/settings/proxy/probe', {}),
+};
+
 export const settingsApi = {
   upstream: () => get<UpstreamConfig>('/api/settings/upstream'),
   saveUpstream: (body: Record<string, unknown>) =>

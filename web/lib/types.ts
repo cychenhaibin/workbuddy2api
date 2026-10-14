@@ -170,6 +170,81 @@ export interface UpstreamStatus {
   error?: string;
 }
 
+export interface ProxyRoute {
+  name: string;
+  scheme: string;
+  host: string;
+  port: number | null;
+  has_auth: boolean;
+  masked: string;
+  local?: boolean;
+  /** 绑定账号数（列表接口一定会给） */
+  bound: number;
+  /** 池里的启用开关：停用的线路不会被自动挑选（显式绑定仍会报错提醒） */
+  enabled: boolean;
+  /** 按权重分摊/挑选（越大越常被选中） */
+  weight: number;
+  /** 前几个绑定账号的昵称（列表里显示 chips） */
+  bound_names?: string[];
+  /** 绑了 ≥3 台时的风控提示（同一个出口 IP 上的号容易被上游按 IP 聚类） */
+  shared_warning?: boolean;
+  /** 上次测试的结果（面板里记着） */
+  probe?: {ok: boolean; ms: number; at: number; exit_ip?: string; error?: string} | null;
+}
+
+export interface RouteAccount {
+  file: string;
+  uid: string;
+  nickname: string;
+  /** 绑定的线路名；空 = 跟随池策略 */
+  proxy: string;
+}
+
+export interface ProxyPool {
+  enabled: boolean;
+  strategy: 'priority' | 'round_robin' | 'random' | 'least_connections';
+  interval_seconds: number;
+  strategies: string[];
+  routes_total: number;
+  routes_enabled: number;
+}
+
+export interface RouteBindingsResponse {
+  accounts: RouteAccount[];
+  routes: string[];
+  pool: ProxyPool;
+}
+
+export interface ProxyRouteList {
+  routes: ProxyRoute[];
+  default: string;
+  schemes: string[];
+  bound_total: number;
+  /** 池配置（开关 / 策略 / 间隔） */
+  pool: ProxyPool;
+}
+
+export interface ProxyProbe {
+  ok: boolean;
+  ms: number;
+  exit_ip?: string;
+  exit_info?: string;
+  error?: string;
+}
+
+export interface ProxySettings {
+  http_proxy: string;
+  update_proxy: string;
+  http_configured: boolean;
+  update_configured: boolean;
+  env_http_proxy: string;
+  env_update_proxy: string;
+  effective: string;
+  source: 'panel' | 'env' | 'none' | 'off';
+  probe_url: string;
+  global_proxy_enabled: boolean;
+}
+
 export interface ModelInfo {
   id: string;
   owned_by?: string;
@@ -871,6 +946,13 @@ export interface VersionSide {
 export interface ManagerVersion extends VersionSide {
   /** Release 页面地址 */
   url: string;
+  /**
+   * 该 Release 是否已附带签名文件。
+   *
+   * `false` = 新版本已发布但维护者还没签名（发布后有个窗口期）：这时更新会被
+   * 拒绝，界面要**先说清楚**，别让人点下去才失败。`null` = 未知（旧缓存）。
+   */
+  sig_ready: boolean | null;
   repo: string;
 }
 

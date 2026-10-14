@@ -62,6 +62,7 @@ import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
+import {UploadAccountsButton} from '@/components/common/accounts/UploadAccountsButton';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
 import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog';
@@ -836,6 +837,9 @@ export default function AccountsPage() {
   }
 
   function renderExpiry(a: Account) {
+    if (a.expires_at <= 0) {
+      return <div className="w-[150px] text-[11px] text-muted-foreground">{t('metric.unknown')}</div>;
+    }
     const pct = expiryBarPercent(a.remain_seconds, a.ttl_seconds);
     const vis = expiryVisual(a.remain_seconds);
     // 「有效期」是剩余时间，刷新会把它重新拉满，所以单看天数分不清
@@ -1026,9 +1030,12 @@ export default function AccountsPage() {
         >
           {stopped ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
         </Button>
+        {/* 账号名放说明里而不是标题：名称可能很长，18px 标题在 380px 弹窗里一折行就挤乱。
+            窄屏用 min() 保住两侧 1rem 留白，单写 380px 会在 <412px 的手机上贴满屏幕边缘。 */}
         <ConfirmDialog
-          title={t('accounts.deleteTitle', {name: a.nickname || a.uid})}
-          description={t('accounts.deleteDesc')}
+          title={t('accounts.deleteTitle')}
+          description={t('accounts.deleteDesc', {name: a.nickname || a.uid})}
+          contentClassName="max-w-[min(380px,calc(100%-2rem))] sm:max-w-[380px]"
           confirmText={t('accounts.delete')}
           destructive
           onConfirm={() => run(a.file, () => accountApi.remove(a.file, groupId),
@@ -1129,6 +1136,9 @@ export default function AccountsPage() {
                   <span className="tabular-nums opacity-70">{pendingCheckin}</span>
                 )}
               </Button>
+            )}
+            {isAdmin && (
+              <UploadAccountsButton upstreamId={groupId} groups={groups} onSuccess={reloadAll} />
             )}
             {isAdmin && (
               <Button size="sm" className="rounded-full" onClick={() => setAddOpen(true)}>

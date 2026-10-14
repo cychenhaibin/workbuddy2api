@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .. import config
 from . import realm as _realm
+from .errtext import err_text
 from .realm import realm_of, supports_checkin
 
 
@@ -185,11 +186,15 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
             {
                 'file': path.name,
                 'proxy': str(raw.get('proxy') or ''),
+                # 会话名：旧版线路地址里的 `{account}` 靠它认出口 IP（界面不展示）。
+                # 旧的 proxy_pool（一个账号挂多条线路）已废弃，不再透传。
+                'proxy_session': str(raw.get('proxy_session') or ''),
                 'uid': str(acct.get('uid', '')),
                 'nickname': acct.get('nickname') or '未命名',
                 'enterprise_id': acct.get('enterpriseId', '') or '',
                 'expires_at': exp,
-                'is_expired': now >= exp,
+                # expiresAt=0 is an unknown expiry, not an already expired token.
+                'is_expired': exp > 0 and now >= exp,
                 'remain_seconds': max(0, int(exp - now)),
                 # 该令牌签发的总时长（供进度条按真实比例展示），解不出为 None
                 'ttl_seconds': ttl,
@@ -419,9 +424,11 @@ ASYNC_HEADERS = {'Content-Type': 'application/json'}
 
 
 def _err_text(exc: Exception) -> str:
-    """异常文本可能为空（如 AssertionError），补上类型名便于排查。"""
-    detail = str(exc).strip()
-    return f'{type(exc).__name__}: {detail}' if detail else type(exc).__name__
+    """异常文本可能为空（如 AssertionError / TimeoutError），补上类型名便于排查。
+
+    统一走 `errtext.err_text`：空文本的超时还会给「超时（等不到响应）」这种人话。
+    """
+    return err_text(exc)
 
 
 def _auth_headers(api_key: str | None = None) -> dict:

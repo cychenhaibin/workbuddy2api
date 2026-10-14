@@ -1,9 +1,12 @@
 """运行期配置：全部通过环境变量覆盖，默认值适配 1Panel 单机部署。"""
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -110,6 +113,8 @@ AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
 HTTP_PROXY = _env('WB_HTTP_PROXY', '')
+# 出口代理探测用的地址（界面上「测试」按钮；默认回出口 IP 与归属地）
+PROXY_PROBE_URL = _env('WB_PROXY_PROBE_URL', 'https://ipinfo.io/json')
 DEFAULT_ACCOUNT_PROXY = _env('WB_DEFAULT_ACCOUNT_PROXY', '')
 
 # 本机一键导入：允许把新密钥直接写进**本机的** cc-switch / ZCode 配置。
@@ -182,38 +187,448 @@ def upstream_api_key() -> str:
         return ''
 
 
-def proxy_routes() -> dict[str, str]:
-    """读取共享命名线路。客户端只能取得线路名，不能取得代理凭据。"""
+DEFAULT_POOL = {
+    'enabled': False,
+    'strategy': 'priority',
+    'interval_seconds': 300,
+}
+STRATEGIES = ('priority', 'round_robin', 'random', 'least_connections')
+
+# least_connections 用「最近调用次数」近似连接数：面板发出的都是短请求（登录/签到/
+# 积分/模型），排队长度基本等于最近这段时间的调用量 —— 与其报一个假的并发数，
+# 不如用这个能自圆其说的近似，并在界面上写明口径。
+_RECENT_CALLS: dict[str, list[float]] = {}
+_RECENT_WINDOW = 60.0
+_ROUND_ROBIN = {'cursor': 0}
+
+
+def _raw_routes() -> dict[str, dict]:
+    """线路表的**原始**形态：名字 → {url, weight, enabled}。
+
+    值允许三种写法（老配置不用动）：
+      `"名字": "地址"`                      → 权重 100、启用
+      `"名字": {"url": "地址", "weight": 30}` → 权重 30、启用
+      `"名字": {"url": "地址", "enabled": false}` → 停用（池里跳过，绑定它的账号报错）
+    """
     try:
-        routes = json.loads(UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('proxies') or {}
+        table = json.loads(UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('proxies') or {}
     except (OSError, ValueError, AttributeError):
         return {}
-    if not isinstance(routes, dict):
+    if not isinstance(table, dict):
         return {}
-    return {k: v for k, v in routes.items()
-            if isinstance(k, str) and k.strip() and isinstance(v, str)}
+    out: dict[str, dict] = {}
+    for name, value in table.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                out[name] = {'url': value, 'weight': 100, 'enabled': True}
+        elif isinstance(value, dict):
+            url = value.get('url')
+            if not isinstance(url, str) or not url.strip():
+                continue
+            weight = value.get('weight', 100)
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
+                weight = 100
+            out[name] = {'url': url, 'weight': int(weight),
+                         'enabled': value.get('enabled', True) is not False}
+    return out
 
 
-def account_proxy(auth: dict) -> str | None:
-    """无绑定时沿用既有出口；绑定无效时拒绝发出请求。"""
-    name = str(auth.get('proxy') or '').strip()
-    if not name:
-        return None
-    url = proxy_routes().get(name)
-    if not url:
-        raise ValueError(f'账号绑定的代理线路 {name!r} 不存在')
+def proxy_routes() -> dict[str, str]:
+    """读取线路表（名字 → 地址）。客户端只能取得线路名，不能取得凭据。"""
+    return {name: entry['url'] for name, entry in _raw_routes().items()}
+
+
+def proxy_route_weights() -> dict[str, int]:
+    """线路名 → 权重（按权重分摊/挑选时用；老写法默认 100）。"""
+    return {name: entry['weight'] for name, entry in _raw_routes().items()}
+
+
+def proxy_route_enabled() -> dict[str, bool]:
+    """线路名 → 是否启用（池里只挑启用的；停用的线路仍可被账号显式绑定）。"""
+    return {name: entry['enabled'] for name, entry in _raw_routes().items()}
+
+
+def proxy_pool_config() -> dict:
+    """代理池配置：开关 / 策略 / 间隔（存面板设置，缺项补默认值）。"""
+    try:
+        from . import db
+        stored = db.get_setting('proxy_pool', {}) or {}
+    except Exception:            # noqa: BLE001 —— 读不到就用默认（池默认关闭）
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    strategy = str(stored.get('strategy') or DEFAULT_POOL['strategy'])
+    if strategy not in STRATEGIES:
+        strategy = DEFAULT_POOL['strategy']
+    try:
+        interval = int(stored.get('interval_seconds', DEFAULT_POOL['interval_seconds']))
+    except (TypeError, ValueError):
+        interval = DEFAULT_POOL['interval_seconds']
+    return {
+        'enabled': bool(stored.get('enabled', DEFAULT_POOL['enabled'])),
+        'strategy': strategy,
+        'interval_seconds': max(0, interval),
+    }
+
+
+def pool_routes() -> dict[str, str]:
+    """池里**可供自动挑选**的线路（启用中）。"""
+    return {name: entry['url'] for name, entry in _raw_routes().items() if entry['enabled']}
+
+
+def _validate_route(name: str, url: str) -> None:
     try:
         parsed = urlsplit(url)
-        valid = parsed.scheme in ('http', 'https') and bool(parsed.hostname) and parsed.port != 0
+        # socks5 / socks5h 由 httpx + socksio 支持（socks5h 把域名解析交给代理）。
+        # socks4/socks4a 实测 httpx 直接报 Unknown scheme，不放进来。
+        valid = (parsed.scheme in ('http', 'https', 'socks5', 'socks5h')
+                 and bool(parsed.hostname) and parsed.port != 0)
     except ValueError:
         valid = False
     if not valid:
-        raise ValueError(f'代理线路 {name!r} 配置无效（需要 HTTP/HTTPS 代理）')
-    return url
+        raise ValueError(f'代理线路 {name!r} 配置无效（需要 HTTP/HTTPS/SOCKS5 代理）')
+
+
+def note_route_use(name: str) -> None:
+    """记一次调用（least_connections 策略用它做近似）。"""
+    if not name:
+        return
+    now = time.time()
+    bucket = _RECENT_CALLS.setdefault(name, [])
+    bucket.append(now)
+    cutoff = now - _RECENT_WINDOW
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(_RECENT_CALLS) > 500:
+        for key in [k for k, v in _RECENT_CALLS.items() if not v][:100]:
+            _RECENT_CALLS.pop(key, None)
+
+
+def choose_pool_route(names: list[str]) -> str:
+    """按池策略从候选里挑一条（names 都已确认可用且启用）。"""
+    pool = proxy_pool_config()
+    strategy = pool['strategy']
+    weights = proxy_route_weights()
+    ordered = sorted(names, key=lambda n: (-weights.get(n, 100), n))
+    if strategy == 'priority':
+        return ordered[0]
+    if strategy == 'round_robin':
+        cursor = _ROUND_ROBIN['cursor'] = (_ROUND_ROBIN['cursor'] + 1) % len(ordered)
+        return ordered[cursor]
+    if strategy == 'least_connections':
+        return min(ordered, key=lambda n: (len(_RECENT_CALLS.get(n, [])), ordered.index(n)))
+    # random：按权重加权随机（权重越大越常被选中）
+    total = sum(max(1, int(weights.get(n, 100))) for n in ordered)
+    point = secrets.randbelow(total)
+    for name in ordered:
+        point -= max(1, int(weights.get(name, 100)))
+        if point < 0:
+            return name
+    return ordered[-1]
+
+
+def _sticky_pick(auth: dict, candidates: list[str]) -> str:
+    """池内选择：间隔窗口内沿用上次那条，窗口过了再按策略重挑并记下。
+
+    为什么要有窗口：一会儿换一个出口在风控眼里就是特征（mihomo 的 sticky-sessions
+    是同一个道理）。窗口长度就是池配置里的「间隔」。
+    """
+    interval = proxy_pool_config()['interval_seconds']
+    if len(candidates) == 1 or interval <= 0:
+        return choose_pool_route(candidates)
+    uid = str(auth.get('uid') or '').strip() or '?'
+    try:
+        from . import db
+        table = db.get_setting('proxy_sticky', {}) or {}
+    except Exception:            # noqa: BLE001 —— 读不到就当作没有粘性
+        table = {}
+    entry = table.get(uid) if isinstance(table, dict) else None
+    if isinstance(entry, dict):
+        last = str(entry.get('route') or '')
+        at = int(entry.get('at') or 0)
+        if last in candidates and time.time() - at < interval:
+            return last
+    chosen = choose_pool_route(candidates)
+    try:
+        from . import db
+        table = db.get_setting('proxy_sticky', {}) or {}
+        if not isinstance(table, dict):
+            table = {}
+        table[uid] = {'route': chosen, 'at': int(time.time())}
+        if len(table) > 2000:      # 上限：粘性过期后自然被覆盖，不会无限膨胀
+            keep = sorted(table.items(), key=lambda kv: int(kv[1].get('at') or 0),
+                          reverse=True)[:2000]
+            table = dict(keep)
+        db.set_setting('proxy_sticky', table)
+    except Exception:            # noqa: BLE001 —— 写不进去只是少了粘性
+        pass
+    return chosen
+
+
+# ── 兼容 1.0.84 的 `{account}` 会话模板 ─────────────────────────────────
+# 那一版让用户把 `{account}` 写在线路地址里，每个账号渲染出自己的会话名（住宅代理
+# 按会话名给粘性 IP）。现在的方案是「池策略 + 账号绑定」，界面上不再有会话这个概念；
+# 但**已经那么写过的地址不能突然发不出去**，所以命中占位符时仍按账号渲染。会话名
+# 沿用账号文件里存下来的 `proxy_session`（那正是它当初被存下来的原因：改昵称不该
+# 悄悄换掉出口 IP），没有就按昵称 / uid 现算。
+SESSION_PLACEHOLDER = '{account}'
+
+
+def route_session_name(auth: dict) -> str:
+    """这个账号在会话模板里用的会话名。"""
+    stored = str(auth.get('proxy_session') or '').strip()
+    if stored:
+        return stored
+    nickname = str(auth.get('nickname') or '').strip()
+    # 只留 ASCII 字母数字：住宅代理的用户名里带中文会被百分号编码，多数服务商不认
+    slug = ''.join(ch.lower() if (ch.isascii() and ch.isalnum()) else '-'
+                   for ch in nickname)
+    while '--' in slug:
+        slug = slug.replace('--', '-')
+    slug = slug.strip('-')[:24]
+    if len(slug) >= 3:
+        return slug
+    return str(auth.get('uid') or '').strip()[:8] or 'acct'
+
+
+def render_route_url(template: str, session: str) -> str:
+    """把 `{account}` 换成会话名；没有占位符就原样返回（= 这条线路人人都一样）。"""
+    return template.replace(SESSION_PLACEHOLDER, session)
+
+
+def _render_for(auth: dict, url: str) -> str:
+    return render_route_url(url, route_session_name(auth)) \
+        if SESSION_PLACEHOLDER in url else url
+
+
+def resolve_account_proxy(auth: dict) -> str | None:
+    """这个账号这次该走哪条线路。顺序（与参考项目的语义一致）：
+
+      1. **账号绑定的线路**（「指定代理」）—— 存在就必须可用：线路被删或地址非法时
+         抛错，而不是悄悄换出口（出口被换掉在风控里是特征变化）；
+         绑定的线路被**停用**同样报错，让用户明确知道「这条线暂停了」。
+      2. **代理池**（开启且有启用中的线路）→ 按策略挑一条（间隔内粘住）。
+      3. **全局上游代理**（开启且配了地址）。
+      4. 直连。
+    """
+    bound = str(auth.get('proxy') or '').strip()
+    if bound:
+        # 走公开访问器（而不是自己重读文件）：既有调用点/测试按这两个函数打桩，
+        # 绕过它们会出现「线路表长什么样」的第二个真相来源。
+        on = proxy_route_enabled()
+        table = {name: {'url': url, 'enabled': on.get(name, True)}
+                 for name, url in proxy_routes().items()}
+        entry = table.get(bound)
+        if entry is None:
+            raise ValueError(f'账号绑定的代理线路 {bound!r} 不存在')
+        if not entry['enabled']:
+            raise ValueError(f'账号绑定的代理线路 {bound!r} 已停用')
+        _validate_route(bound, entry['url'])
+        note_route_use(bound)
+        return _render_for(auth, entry['url'])
+
+    pool = proxy_pool_config()
+    if pool['enabled']:
+        available = pool_routes()
+        if available:
+            chosen = _sticky_pick(auth, list(available))
+            _validate_route(chosen, available[chosen])
+            note_route_use(chosen)
+            return _render_for(auth, available[chosen])
+
+    global_proxy = global_http_proxy()
+    if global_proxy:
+        _validate_route('全局上游代理', global_proxy)
+        return global_proxy
+    return None
+
+
+def global_http_proxy() -> str:
+    """全局上游代理：面板设置里配了且开启时生效，否则回落环境变量 WB_HTTP_PROXY。
+
+    位置与参考项目的「Global Proxy」一致：池不可用（关了 / 没有启用中的线路）时的
+    兜底出口。
+    """
+    try:
+        from . import db
+        if db.get_setting('global_proxy_enabled', True) is False:
+            return ''
+        stored = str(db.get_setting('http_proxy', '') or '').strip()
+    except Exception:            # noqa: BLE001
+        stored = ''
+    return stored or HTTP_PROXY
+
+
+def account_proxy(auth: dict) -> str | None:
+    """无绑定时沿用既有出口；绑定无效时拒绝发出请求（对外保持原签名）。"""
+    return resolve_account_proxy(auth)
 
 
 def new_secret() -> str:
     return secrets.token_urlsafe(48)
+
+
+# ── 出站客户端池（issue #144）────────────────────────────────
+#
+# 为什么不再每次新建：Windows 上构造 httpx.AsyncClient 会去加载系统证书库建 SSL
+# 上下文，实测 **~1 秒**（Linux 上没这么夸张，所以这个问题只在原生 Windows 部署
+# 上暴露）。面板的每个页面切换都要问上游几次（账号/状态/模型），于是「每次出站
+# 新建客户端」直接表现成「切页面慢 1~3 秒」。共享之后同一套配置只建一次。
+#
+# 键里带**事件循环**：httpx 的客户端（连接池）绑在创建它的那个循环上，跨循环
+# 复用会炸（同步路由里 `asyncio.run` 另起循环那条路就是例子，见
+# `modelcatalog.fetch_ids_blocking`）。不同循环各建一个，互不干扰。
+_CLIENTS: dict[tuple, tuple] = {}
+_CLIENTS_MAX = 24
+
+
+class _BorrowedClient:
+    """借出去用的客户端：退出 `async with` 时**不关闭**（归还给池）。
+
+    调用点大多是 `async with config.http_client(...) as client:` 的写法，所以这里
+    只把「上下文管理」这层语义接过来，避免改十几个调用点。关闭由
+    `close_clients()`（应用退出）或池满淘汰时统一做。
+
+    另外**代理属性访问**（`__getattr__`）并让 `aclose()` 变成「归还」而不是真关：
+    有几处调用点是不用 `async with`、自己 `client = http_client(...)` 然后
+    `finally: await client.aclose()` 的写法（网关、Anthropic 兼容、测试台、Responses
+    各一处）。共享之后，那些 `aclose()` 一旦真关，就会把别人正在用的连接池一起关掉
+    ——并发下表现为「偶发请求失败」。所以借来的客户端只支持「还」，真关只发生在池
+    淘汰与退出清理里。
+    """
+
+    __slots__ = ('_client',)
+
+    def __init__(self, client) -> None:  # noqa: ANN001
+        self._client = client
+
+    def __getattr__(self, name: str):  # noqa: ANN201
+        # 借用包装要能当客户端用（post/stream/headers/... 一律转发）
+        return getattr(self._client, name)
+
+    async def __aenter__(self):  # noqa: ANN201
+        return self._client
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def aclose(self) -> None:
+        """借用语义：只归还，不真关（共享客户端由池统一管理）。"""
+        return None
+
+
+def _timeout_key(tmo) -> tuple:  # noqa: ANN001
+    return (tmo.connect, tmo.read, tmo.write, tmo.pool)
+
+
+_INTERNAL_SUFFIXES = ('.local', '.internal', '.lan', '.docker', '.localhost')
+
+
+def _is_internal_host(host: str | None) -> bool:
+    """这个目标算不算「内网 / 本机」——算的话不该交给外部代理。
+
+    覆盖三类：回环与常见内网别名、私有 / 链路本地 / 保留网段的 IP、**单标签主机名**
+    （容器服务名 `workbuddy2api` 这类；公网域名一定带点）。
+    """
+    h = (host or '').strip().lower().rstrip('.')
+    if not h:
+        return False
+    if h in ('localhost', 'host.docker.internal', 'host.containers.internal'):
+        return True
+    if h.endswith(_INTERNAL_SUFFIXES) or '.' not in h:
+        # 单标签 = 内网 DNS（容器服务名、`myhost` 之类）。公网目标必然带点。
+        return True
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return bool(addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_unspecified)
+
+
+def _proxy_transport(proxy: str):  # noqa: ANN202
+    """「内网/本机直连、其余走代理」的 httpx transport。
+
+    用自定义 transport 而不是 `mounts=`：mounts 只能按主机名模式匹配，表达不了
+    「私有网段」「单标签主机名」这两类，而它们恰恰是容器部署的常态（`workbuddy2api`、
+    `host.docker.internal`、`10.x`…）。
+
+    类建在这里而不是模块顶层，是因为 httpx 在本模块是**按需导入**的（保持冷启动
+    不加载它）；每个 (循环, 超时, 代理) 组合只建一次客户端，这点构造开销可忽略。
+    """
+    import httpx
+
+    class _DirectForInternalTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self._proxied = httpx.AsyncHTTPTransport(proxy=proxy)
+            self._direct = httpx.AsyncHTTPTransport()
+
+        async def handle_async_request(self, request):  # noqa: ANN001, ANN201
+            transport = (self._direct if _is_internal_host(request.url.host)
+                         else self._proxied)
+            return await transport.handle_async_request(request)
+
+        async def aclose(self) -> None:
+            await self._proxied.aclose()
+            await self._direct.aclose()
+
+    return _DirectForInternalTransport()
+
+
+def _build_client(tmo, proxy: str | None):  # noqa: ANN001, ANN202
+    import httpx
+
+    kwargs: dict = {'timeout': tmo, 'trust_env': False}
+    if proxy:
+        kwargs['transport'] = _proxy_transport(proxy)
+    return httpx.AsyncClient(**kwargs)
+
+
+async def close_clients() -> None:
+    """关掉池里所有客户端（应用退出时调用；幂等）。"""
+    clients = [entry[1] for entry in _CLIENTS.values()]
+    _CLIENTS.clear()
+    for client in clients:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 —— 退出路径上的清理失败不该再抛
+            continue
+
+
+def _evict(loop) -> None:  # noqa: ANN001
+    """池满了淘汰最早的一个（按插入顺序）。"""
+    while len(_CLIENTS) > _CLIENTS_MAX:
+        key = next(iter(_CLIENTS))
+        entry = _CLIENTS.pop(key, None)
+        if not entry or entry[1].is_closed:
+            continue
+        old_loop, client = entry
+        try:
+            if old_loop is loop:
+                loop.create_task(client.aclose())      # 同一循环才能安全关闭
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def stored_http_proxy() -> str:
+    """面板设置里存的出口代理；空串 = 没设过（回落到环境变量）。"""
+    try:
+        from . import db          # 延迟导入：config 被 db 反过来 import，顶层会成环
+        value = db.get_setting('http_proxy', '')
+    except Exception:             # noqa: BLE001 —— 读不到就当没设过，别让出站挂掉
+        return ''
+    return str(value or '').strip()
+
+
+def effective_http_proxy() -> str:
+    """当前生效的**全局**出口代理（面板设置优先、环境变量兜底，开关可关）。
+
+    注意它只影响「没有走账号线路/代理池」的那部分请求；账号出口的优先级见
+    `resolve_account_proxy`（绑定线路 → 代理池 → 这里 → 直连）。
+    """
+    return global_http_proxy()
 
 
 def http_client(timeout, *, connect: float | None = None, proxy: str | None = None):
@@ -224,6 +639,10 @@ def http_client(timeout, *, connect: float | None = None, proxy: str | None = No
     timeout 可以传数字，也可以传已构造好的 httpx.Timeout。
     注意：httpx 不允许「Timeout 实例 + connect 关键字」同时传，
     因此传入实例时忽略 connect，避免 AssertionError。
+
+    **返回的是借用语义的上下文管理器**（退出时不关客户端，见 `_BorrowedClient`）：
+    同一事件循环 + 同一组超时/代理只建一次，连接池复用（issue #144：Windows 上
+    每次新建要 ~1 秒，正好是页面切换的耗时）。
     """
     import httpx
 
@@ -233,8 +652,20 @@ def http_client(timeout, *, connect: float | None = None, proxy: str | None = No
         tmo = httpx.Timeout(timeout, connect=connect)
     else:
         tmo = httpx.Timeout(timeout)
-    kwargs = {'timeout': tmo, 'trust_env': False}
-    selected_proxy = HTTP_PROXY if proxy is None else proxy
-    if selected_proxy:
-        kwargs['proxy'] = selected_proxy
-    return httpx.AsyncClient(**kwargs)
+    selected_proxy = effective_http_proxy() if proxy is None else proxy
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 事件循环外（同步夹具/脚本场景）：不缓存，按老样子建一个即用即弃的，
+        # 免得把一个绑在未知循环上的客户端留在池里。
+        return _build_client(tmo, selected_proxy)
+
+    key = (*_timeout_key(tmo), selected_proxy or '')
+    entry = _CLIENTS.get(key)
+    if entry is not None and entry[0] is loop and not entry[1].is_closed:
+        return _BorrowedClient(entry[1])
+    client = _build_client(tmo, selected_proxy)
+    _CLIENTS[key] = (loop, client)
+    _evict(loop)
+    return _BorrowedClient(client)
