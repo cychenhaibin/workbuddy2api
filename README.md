@@ -17,6 +17,10 @@
 
 [English](README.en.md) · **简体中文** ｜ 本项目在 [LINUX DO](https://linux.do) 社区发布与交流
 
+<p align="center">
+  <strong>⚠️ 使用边界：</strong>本项目只用于管理<strong>本人及亲属自愿授权</strong>的账号；禁止批量注册、账号交易、代注册、接码、盗号、绕过平台风控，以及任何商业转售或盈利性用途。使用即表示你已阅读并同意<a href="#使用边界与免责声明">完整免责声明</a>。
+</p>
+
 <a href="https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助位）" width="100%" /></a>
 
 **赞助商**：[ProxyLane](https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme) 住宅代理，覆盖 195 个国家，95%+ IP 获 Scamalytics 低风险评级。在 `WB_HTTP_PROXY` 的用户名里写上国家、城市和会话名，每个实例走一个住宅 IP，最长 72 小时不变，换 IP 也留在同一城市。
@@ -115,145 +119,46 @@
 
 ---
 
+## 官方下载源
+
+**只从本仓库的 [Releases](https://github.com/ithtelab/workbuddy-manager/releases) 下载。** 本项目的官方发布包提供 sha256 与 `.sig` 签名，更新器会核对它们。
+
+近期有第三方账号在 issue 里引导用户到 `github.com/AEmbers/workbuddy-manager` 下载所谓 `v2.8.4` / `v2.8.5`，并声称“已独立接手本项目”。该 fork 未获得本项目授权，构建也没有本项目的离线签名，无法按官方校验链确认来源和完整性。**不要为了安装第三方包设置 `WB_SKIP_SIGNATURE=1` 或跳过摘要校验。**
+
+如果已经在第三方包上登录过面板或填写过上游账号，建议轮换面板管理员密码和上游账号授权，然后重新安装官方发布包。
+
+---
+
 ## 快速开始
 
-### 一、本地开发
+服务器部署需要 Docker（1 核 1G 起）；Windows 桌面用户可直接用图形安装器。三种方式任选：
 
-```bash
-# 0) 可选：本机没有真实的 workbuddy2api 时，起一个模拟上游
-#    自带模型列表与示例账号，便于查看完整界面
-python dev/mock_upstream.py         # 监听 127.0.0.1:7863
+**① Windows 安装器（桌面图形化，无需 Docker / 命令行）**
 
-# 1) 后端（终端 A）
-python -m pip install -r server/requirements.txt
-WB_ADMIN_PASSWORD=admin123 \
-WB_DATA_DIR=./data \
-WB_AUTH_DIR=/opt/workbuddy2api/auths \
-WB2API_BASE=http://127.0.0.1:7863 \
-python -m uvicorn server.main:app --reload --port 7864
+1. 从该版本 [Release](https://github.com/ithtelab/workbuddy-manager/releases) 下载
+   `WorkBuddyManagerSetup.exe`（发版时由 CI 在 Windows runner 上自动构建并附带，同目录还有
+   一个 `.sha256` 可核对）。v1.0.88 的安装器曾因卸载会误删文件被下线（见该版本 Release
+   说明），**v1.0.89 起已修复**：卸载只删程序自己的文件，安装目录也改成「选中目录 +
+   `WorkBuddyManager` 子目录」。
+2. 按向导选择安装目录 → 安装 → 完成时可勾选「立即启动」。
+3. 之后用桌面快捷方式打开控制台：点 **启动项目**，状态变「运行中」并自动打开管理面板；
+   随时可 **重启 / 关闭项目**、修改监听 IP 与端口（保存后重启生效）、点 **打开面板** 回到页面。
+4. 点 X 可选「最小化到托盘」或「退出程序」（可记住选择，托盘图标随时恢复）。
 
-# 2) 前端（终端 B）—— next dev 会把 /api、/v1 反代到 :7864
-cd web
-npm install
-npm run dev                          # http://localhost:3000
-```
+> 默认成功构建的单文件安装包内置全部运行环境（Python 运行时、上游网关、前端页面），
+> 目标机器**无需安装任何依赖**，Windows 10 (1903+) / 11 双击即用。当前安装器没有
+> Authenticode 签名，SmartScreen 可能显示警告；请确认文件来自可信 Release 或自行构建。
+> 安装器自身不会自动升级，升级时重新获取新 exe 并覆盖安装即可；`.env`、账号和 `data`
+> 等个人数据会保留。卸载：**设置 → 应用** 或开始菜单「卸载 WorkBuddy Manager」，
+> 可选保留账号与配置。细节见 [Windows 启动器](windows/README.md#启动器安装版)。
 
-首次启动会自动生成 `users.json` 与随机签名密钥。若未设置 `WB_ADMIN_PASSWORD`，会在日志中打印一次随机管理员密码。
-
-> **代理注意事项**
-> 若本机装有代理软件（Clash / V2Ray 等），**尤其是 TUN 模式**，访问 `127.0.0.1:7863` 可能被代理劫持，表现为接口长时间无响应。
-> 本项目对内部请求默认 `trust_env=False`（不读取系统代理）；确需走代理时设置 `WB_HTTP_PROXY`。
-> TUN 模式下请在代理软件中把 `127.0.0.1` 加入直连 / 绕过列表。
-
-#### 运行测试
-
-```bash
-# 配置读写的回归测试：时刻数组 / 时长字符串 / 部分提交不覆盖同段其他键
-python -m unittest discover -s server/tests -t . -v
-```
-
-> 测试用临时目录模拟上游 `config.json`，不触碰真实配置，可安全反复运行。
-> 这一组测试专门守住两个曾经写坏配置的坑：把整点数组当成数字间隔、
-> 把时长字符串当成秒数。
-
-### 二、Windows 原生部署（无需 Docker）
-
-前提：`workbuddy2api` 已在本机运行，并有可用的启停脚本与文件日志。
-
-```powershell
-git clone https://github.com/ithtelab/workbuddy-manager.git
-cd workbuddy-manager
-Copy-Item .env.example .env
-```
-
-在 `.env` 中至少设置以下项目（Windows 路径建议使用 `/`）：
-
-```dotenv
-WB_MANAGER_HOST=127.0.0.1
-WB_SECURE_COOKIE=false
-WB2API_MODE=native
-WB_UPSTREAM_DIR=C:/path/to/workbuddy2api
-WB_AUTH_DIR=C:/path/to/workbuddy2api/auths
-WB_UPSTREAM_CONFIG=C:/path/to/workbuddy2api/config.json
-WB2API_START_SCRIPT=C:/path/to/workbuddy2api/start-workbuddy2api.cmd
-WB2API_STOP_SCRIPT=C:/path/to/workbuddy2api/stop-workbuddy2api.cmd
-WB2API_LOG_FILE=C:/path/to/workbuddy2api/data/server.err.log
-```
-
-安装依赖、构建前端并后台启动：
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r server\requirements.txt
-Set-Location web
-npm ci
-npm run build:export
-Set-Location ..
-powershell -ExecutionPolicy Bypass -File .\service-tools.ps1 start
-```
-
-用 `service-tools.ps1 status|restart|stop` 管理后台进程。Windows 原生模式支持
-保存配置后重启上游及读取上游日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
-请手动更新代码后重启服务。
-
-> **启停脚本优先用上游自带的**：上游 `workbuddy2api` 2026-09-18 起自带
-> `start/stop/status-workbuddy2api.cmd`（PID 文件 + 进程路径校验，不会误杀同名进程），
-> 直接把 `WB2API_START_SCRIPT` / `WB2API_STOP_SCRIPT` 指过去即可。若你的上游目录里
-> 没有这三个文件（旧版上游），`deploy/windows-native/` 下有一对可直接改用的模板。
-
-> **两个约定必须满足**（上游脚本已满足）：启动脚本要**立即返回**（前台运行会让
-> 「重启」等到超时才报失败），日志要写到 `WB2API_LOG_FILE`（否则「任务记录」读不到
-> 自动任务日志）。细节见 `deploy/windows-native/README.md`。
-
-### 三、Docker 部署
-
-仓库自带 `Dockerfile` 与 `docker-compose.yml`，适合已经用 Docker 跑上游的用户：
-
-```bash
-git clone https://github.com/ithtelab/workbuddy-manager.git
-cd workbuddy-manager
-# 按需改 compose 里的 WB2API_BASE 与卷路径（默认假设上游在 ../workbuddy2api）
-docker compose up -d --build
-docker compose logs workbuddy-manager | grep -A2 密码   # 首启随机密码
-```
-
-> **前端会在镜像里自动构建**：`web/out`（前端产物）不入库，所以 `git clone` 得到的
-> 工作区里没有它。构建时若发现没有，就自动在容器内 `npm ci && next build`
-> （约 1-2 分钟，首次会拉取 Node 镜像）；若已有（例如从 Release 包解压出来的），
-> 则直接复用、跳过这一步。两条路都不需要你事先装 Node 或手动构建。
->
-> 国内网络下 npm 官方源可能很慢，可加镜像：
-> `docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com`
-
-也可以直接用构建好的镜像（每次发版会推到 GHCR）：
-
-```bash
-docker pull ghcr.io/cychenhaibin/workbuddy2api:latest
-```
-
-> 镜像**同时提供 `linux/amd64` 与 `linux/arm64`**（Apple Silicon、ARM 云主机可直接拉取，
-> 无需 QEMU 模拟）。`docker pull` 会按你的机器架构自动选择对应的那一份。
-
-**想用自己构建的镜像？fork 一下就行** —— 上面那份是维护者发版时构建的。如果你要
-改点什么再自己用（换默认配置、加个依赖，或者只是不想依赖别人的镜像仓库），fork
-本仓库后把 fork 专用工作流放进 `.github/workflows/`，推一次代码就自动构建：
-
-```bash
-mkdir -p .github/workflows
-cp deploy/fork-image/build-image.yml .github/workflows/
-git add .github/workflows/build-image.yml && git commit -m "ci: 构建自己的镜像" && git push
-```
-
-部署需要一台能跑 Docker 的服务器（1 核 1G 起）。两种方式任选：
-
-
-**① Docker（自己起容器）**
+**② Docker（自己起容器）**
 
 ```bash
 docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
 ```
 
-**② 服务器一键脚本（装依赖、拉包、配 systemd）**
+**③ 服务器一键脚本（装依赖、拉包、配 systemd）**
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/main/deploy/install.sh)
@@ -381,6 +286,28 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 - [**linux-do/cdk**](https://github.com/linux-do/cdk)（MIT）—— 界面设计令牌与浮动底栏组件来源，本项目 UI 视觉与其保持一致
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理（MIT；源码随本项目的发布包分发，版权归原作者）
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考
+
+---
+
+## 使用边界与免责声明
+
+**本项目的初衷是方便个人管理本人及亲属自愿授权的账号，不是为批量运营或商业牟利设计的。**
+
+允许的用途：
+
+- 管理你本人或亲属明确授权给你的腾讯 CodeBuddy 账号；
+- 在自己的设备或内网中学习、研究和自用。
+
+禁止的用途：
+
+- 批量注册、代注册、接码，以及买卖、出租或交易账号；
+- 盗号、撞库、绕过实名认证、风控、区域限制或其他平台安全机制；
+- 将本项目或其派生服务用于对外收费、转售、引流或其他盈利性用途；
+- 任何违反腾讯服务条款、当地法律法规或侵犯他人权益的用途。
+
+使用者应自行确认账号授权与使用方式合法合规。因滥用、误用或违反上述边界导致的封号、数据丢失、服务中断或法律责任，由使用者自行承担；项目作者与贡献者不对使用者的行为负责，也不提供任何形式的担保。
+
+本项目与腾讯、CodeBuddy 官方无隶属或合作关系；相关商标归其权利人所有。项目按 [MIT](LICENSE) 许可「按现状」提供。
 
 ---
 

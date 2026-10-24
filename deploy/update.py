@@ -14,11 +14,13 @@
 2. **状态外置**：进度写入 JSON 文件，管理端读取该文件展示实时日志。
    （更新会重启管理端，若用 HTTP 流式返回会被中断）
 3. **幂等与安全**：上游更新会保留账号文件与配置；并**强制把端口绑定收敛为
-   127.0.0.1**，避免 upstream 仓库里的 `7863:7863` 覆盖我们的安全加固。
+   仅本机/容器网桥**，避免 upstream 仓库里的 `7863:7863` 覆盖我们的安全加固。
+   容器经 `host.docker.internal` 连上游时绑宿主网桥地址（issue #243）。
 """
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import http.client
@@ -27,6 +29,7 @@ import re
 import shutil
 import signal
 import site
+import socket
 import stat
 import subprocess
 import sys
@@ -57,7 +60,15 @@ _force_utf8_stdio()
 
 
 # ── 运行环境（与 server/config.py 保持一致的默认值）──────────
-INSTALL_DIR = Path(os.environ.get('WB_INSTALL_DIR') or Path(__file__).resolve().parent.parent)
+def _default_install_dir() -> Path:
+    """本脚本可能位于 `deploy/` 或 `server/deploy/`（随 server 替换的那份）。"""
+    here = Path(__file__).resolve()
+    if here.parent.name == 'deploy' and here.parent.parent.name == 'server':
+        return here.parent.parent.parent
+    return here.parent.parent
+
+
+INSTALL_DIR = Path(os.environ.get('WB_INSTALL_DIR') or _default_install_dir())
 UPSTREAM_DIR = Path(os.environ.get('WB_UPSTREAM_DIR') or '/opt/workbuddy2api')
 UPSTREAM_PORT = int(os.environ.get('WB_UPSTREAM_PORT') or 7863)
 MANAGER_PORT = int(os.environ.get('WB_MANAGER_PORT') or 7864)
@@ -142,6 +153,29 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers)
 
 
+def redact_proxy(url: str) -> str:
+    """把代理地址里的用户名/密码换成 ***。
+
+    为什么必须做：下载失败时的提示会原样拼进 `UPDATE_PROXY`，而它是
+    `http://user:password@host` 形态 —— 这条提示会写进 update-status.json，管理端
+    任何登录用户都能读（状态接口不是管理员专用）。凭据只在部署者的 .env 里，
+    不该因为一次下载失败就泄露给只读账号。
+    """
+    if not url:
+        return ''
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if not (parts.username or parts.password):
+        return url
+    host = parts.hostname or ''
+    if parts.port:
+        host = f'{host}:{parts.port}'
+    return urllib.parse.urlunsplit(
+        (parts.scheme, f'***@{host}', parts.path, parts.query, parts.fragment))
+
+
 def _download_hint(exc: BaseException) -> str:
     """下载失败的**可操作**提示：区分「网络到不了 GitHub」与其它原因。"""
     text = str(exc)
@@ -153,13 +187,75 @@ def _download_hint(exc: BaseException) -> str:
     if not looks_like_network:
         return ''
     if UPDATE_PROXY:
-        return (f'（已配置代理 {UPDATE_PROXY}，仍连不上 —— 检查代理地址是否可从本机访问、'
-                f'以及它是否放行 github.com）')
+        return (f'（已配置代理 {redact_proxy(UPDATE_PROXY)}，仍连不上 —— 检查代理地址是否'
+                f'可从本机访问、以及它是否放行 github.com）')
     if urllib.request.getproxies():
         return '（当前使用的是环境变量里的代理；若代理不可用，可用 WB_UPDATE_PROXY 指定一个）'
-    return ('（当前网络似乎无法直连 GitHub。容器/内网环境请在 .env 里设置 '
-            'WB_UPDATE_PROXY=http://<宿主IP>:<端口> 后重试，例如 http://172.17.0.1:7890）')
-UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/Sliverkiss/workbuddy2api.git'
+    return ('（当前网络似乎无法直连 GitHub。容器/内网环境可在 .env 里设置 '
+            'WB_UPDATE_PROXY=http://<宿主IP>:<端口>，或设置镜像 WB_GITHUB_MIRROR='
+            'https://gh-proxy.com/ 后重试）')
+
+
+# ── GitHub 镜像（issue #216）──────────────────────────────────
+# 国内机器直连 github.com / api.github.com 经常超时。gh-proxy 这类加速服务的
+# 用法是「镜像基址 + 完整原始地址」：
+#   https://gh-proxy.com/https://github.com/<owner>/<repo>/releases/download/...
+# 只在**用户显式配置**时启用：镜像会把请求转给第三方，这是部署者才能决定的事。
+# 同理，GitHub Token 绝不能发给镜像（见 _github_headers）—— 镜像本身也不需要它，
+# 它按自己的出口访问 GitHub。
+_GITHUB_PREFIXES = (
+    'https://github.com/',
+    'https://api.github.com/',
+    'https://codeload.github.com/',
+    'https://raw.githubusercontent.com/',
+    'https://objects.githubusercontent.com/',
+)
+
+
+def normalize_mirror(value: str) -> str:
+    """把镜像基址规范成 `https://host/`（或带子路径的 `https://host/prefix/`）。
+
+    非法值返回空串 = 不启用。带查询串 / 片段的地址直接拒绝：拼出来的地址必须是
+    「基址 + 完整原始地址」，多一个 `?` 或 `#` 都会让后半截被当成镜像自己的参数，
+    结果下载到一个错误页（而错误页的大小检查只在极端情况下才拦得住）。
+    """
+    raw = (value or '').strip()
+    if not raw or any(c.isspace() for c in raw):
+        return ''
+    if '://' not in raw:
+        raw = 'https://' + raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ''
+    if parts.scheme not in ('http', 'https') or not parts.hostname:
+        return ''
+    # 主机段只允许主机名/IP 字面量会出现的字符：`https://not a url` 这类
+    # 输入会被 urlsplit 当成合法 hostname，拼出来的地址必然连不上。
+    if not re.fullmatch(r'[A-Za-z0-9._\-:\[\]]+', parts.netloc):
+        return ''
+    if parts.query or parts.fragment:
+        return ''
+    return f'{parts.scheme}://{parts.netloc}{parts.path.rstrip("/")}/'
+
+
+GITHUB_MIRROR = normalize_mirror(os.environ.get('WB_GITHUB_MIRROR') or '')
+
+
+def mirror_url(url: str) -> str:
+    """给 GitHub 地址套上镜像前缀；未配置镜像或非 GitHub 地址原样返回。"""
+    if not GITHUB_MIRROR or not url:
+        return url
+    if not url.startswith(_GITHUB_PREFIXES):
+        return url
+    return f'{GITHUB_MIRROR}{url}'
+
+
+def is_mirrored(url: str) -> bool:
+    """这个地址是不是我们拼出来的镜像地址（用来决定「能不能带凭据」）。"""
+    return bool(GITHUB_MIRROR) and bool(url) and url.startswith(GITHUB_MIRROR)
+
+
 SERVICE_NAME = os.environ.get('WB_SERVICE_NAME') or 'workbuddy-web'
 DATA_DIR = Path(os.environ.get('WB_DATA_DIR') or INSTALL_DIR / 'data')
 STATUS_FILE = Path(os.environ.get('WB_UPDATE_STATUS') or DATA_DIR / 'update-status.json')
@@ -170,12 +266,14 @@ STATUS_FILE = Path(os.environ.get('WB_UPDATE_STATUS') or DATA_DIR / 'update-stat
 # 自己，这是 Docker 的模型决定的，不是缺功能。
 # 取 auto：能探测到容器就按容器处理，否则按 systemd。
 RUN_MODE = (os.environ.get('WB_RUN_MODE') or 'auto').strip().lower()
-# 上游版本固定：写入提交号/标签后，上游更新会检出该版本而不是跟随分支。
-# 用途：上游某个提交自身有问题（如 Dockerfile 引用了已删除的文件）时，
-# 可以固定回上一个可用提交，避免「一更就坏、且没有退路」。
-UPSTREAM_REF_FILE = Path(os.environ.get('WB_UPSTREAM_REF_FILE') or DATA_DIR / 'upstream-ref.txt')
 
 STEP_TIMEOUT = int(os.environ.get('WB_UPDATE_STEP_TIMEOUT') or 900)
+
+# 离线升级包（面板「上传更新包」用；issue #153）：指向本机的一份发布包 tar.gz。
+# 走这条路时**不查 GitHub**：版本号从包里的 .version 读；完整性核对复用
+# verify_download（用户在面板里填了发布页 sha256 的话，这里就一并核对）。
+OFFLINE_PACKAGE = (os.environ.get('WB_UPDATE_PACKAGE') or '').strip()
+OFFLINE_PACKAGE_SHA256 = (os.environ.get('WB_UPDATE_PACKAGE_SHA256') or '').strip().lower()
 
 # ── 发布包完整性校验 ─────────────────────────────────────
 # 更新器从项目的 GitHub Release 拉包（HTTPS），并核对**发布页给的 sha256 摘要**
@@ -287,16 +385,22 @@ def run(cmd: list[str], cwd: Path | None = None, rep: Reporter | None = None,
     return proc.returncode, out
 
 
-def _github_headers() -> dict:
+def _github_headers(url: str = '') -> dict:
     """GitHub API 请求头；设了 WB_GITHUB_TOKEN / GITHUB_TOKEN 则认证。
 
     未认证限额只有 60 次/小时/IP，共享出口（TUN/系统代理）极易被同出口的
     其他用户打满，表现为偶发 HTTP 403；认证后为 5000 次/小时。
+
+    **走镜像时绝不带 Authorization**（issue #216）：镜像会把请求转给第三方，
+    凭据不该为了「下载快一点」而离开本机。镜像按自己的出口访问 GitHub，
+    也不需要我们的配额。
     """
     headers = {
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'workbuddy-manager-updater',
     }
+    if is_mirrored(url):
+        return headers
     token = (os.environ.get('WB_GITHUB_TOKEN')
              or os.environ.get('GITHUB_TOKEN') or '').strip()
     if token:
@@ -304,21 +408,55 @@ def _github_headers() -> dict:
     return headers
 
 
-def http_json(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers=_github_headers())
-    try:
-        with _opener().open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode('utf-8'))
-    except urllib.error.HTTPError as exc:
-        # 把 GitHub 的可读原因带出来（如 "API rate limit exceeded for x.x.x.x"），
-        # 否则调用方只能打出 "HTTP 403"，无从判断是该等配额重置还是换网络
-        detail = ''
-        try:
-            detail = exc.read().decode('utf-8', errors='replace').strip()[:200]
-        except Exception:  # noqa: BLE001
-            pass
-        raise RuntimeError(f'HTTP {exc.code} {exc.reason} {detail}'.strip()) from exc
+def _url_candidates(url: str, *, use_mirror: bool = True) -> list[str]:
+    """同一个资源的候选地址：镜像优先，直连兜底（未配镜像时只有直连）。"""
+    if not use_mirror:
+        return [url]
+    proxied = mirror_url(url)
+    return [proxied, url] if proxied != url else [url]
 
+
+# 最近一次「镜像失败、已回退直连」的原因。由 http_json 写入、_fetch_release_info
+# 读出并记进日志 —— 不记的话，用户明明配了镜像却看到直连被限流的 403，
+# 会以为镜像压根没生效。用模块级变量而不是给 http_json 加 rep 参数：
+# 测试里有 `http_json = lambda url, timeout=20: …` 这类替换，加参数会破坏它们。
+_mirror_fallback_error = ''
+
+
+def http_json(url: str, timeout: int = 20, *, use_mirror: bool = True) -> dict:
+    """取一个 JSON；配了镜像就先走镜像，失败再直连（issue #216）。
+
+    **404 不回退**：镜像明确回答「仓库/Release 不存在」时，直连只会给出同一个
+    结论（或更糟 —— 被限流的 403 把真实原因盖掉）。403/429 这类「换条路可能
+    就好」的才值得回退。
+    """
+    global _mirror_fallback_error
+    _mirror_fallback_error = ''
+    candidates = _url_candidates(url, use_mirror=use_mirror)
+    last: BaseException | None = None
+    for idx, candidate in enumerate(candidates):
+        req = urllib.request.Request(candidate, headers=_github_headers(candidate))
+        try:
+            with _opener().open(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            # 把 GitHub 的可读原因带出来（如 "API rate limit exceeded for x.x.x.x"），
+            # 否则调用方只能打出 "HTTP 403"，无从判断是该等配额重置还是换网络
+            detail = ''
+            try:
+                detail = exc.read().decode('utf-8', errors='replace').strip()[:200]
+            except Exception:  # noqa: BLE001
+                pass
+            last = RuntimeError(f'HTTP {exc.code} {exc.reason} {detail}'.strip())
+            if exc.code == 404:
+                raise last from exc
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            # 网络不通、镜像返回的不是 JSON（错误页 / 维护公告）都算这条候选失败
+            last = exc
+        if idx + 1 < len(candidates):
+            _mirror_fallback_error = str(last)
+    assert last is not None
+    raise last
 
 
 def download(url: str, dest: Path, rep: Reporter) -> None:
@@ -329,8 +467,30 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
     对偶发网络失败（连接重置、响应中断、5xx）自动重试一次：更新是低频操作，
     多花一次下载的代价远小于整次更新失败；4xx 是请求本身的问题（版本不存在、
     地址错），重试不会变好，直接抛出。
+
+    配了 GitHub 镜像（issue #216）时先走镜像，失败再直连 —— 镜像本身也会抖动，
+    不能因为它挂了就让整个更新不可用。
     """
-    rep.log(f'下载 {url}')
+    last: BaseException | None = None
+    for candidate in _url_candidates(url):
+        if candidate != url:
+            rep.log(f'经镜像下载 {candidate}')
+        else:
+            rep.log(f'下载 {candidate}')
+        last = _download_once(candidate, dest, rep)
+        if last is None:
+            return
+        if candidate != url:
+            rep.log(f'镜像下载失败（{last}），回退直连…', 'warn')
+    assert last is not None
+    # 只有「看着像网络到不了 GitHub」的失败才补一句可操作提示；其余照原样抛出，
+    # 保持调用方与既有测试看到的异常类型不变。
+    hint = _download_hint(last)
+    raise RuntimeError(f'{last} {hint}') if hint else last
+
+
+def _download_once(url: str, dest: Path, rep: Reporter) -> BaseException | None:
+    """下载到 dest；成功返回 None，失败返回最后一次异常（不抛出）。"""
     last: BaseException | None = None
     for attempt in (1, 2):
         try:
@@ -341,7 +501,7 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
             break
         except urllib.error.HTTPError as exc:
             if exc.code < 500:
-                raise
+                return exc
             last = exc
         except (OSError, http.client.HTTPException) as exc:
             # URLError/socket.timeout/ConnectionReset 等都是 OSError 子类；
@@ -350,15 +510,14 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
         if attempt == 1:
             rep.log(f'下载失败（{last}），自动重试一次…', 'warn')
     if last is not None:
-        # 只有「看着像网络到不了 GitHub」的失败才补一句可操作提示；其余照原样抛出，
-        # 保持调用方与既有测试看到的异常类型不变。
-        hint = _download_hint(last)
-        raise RuntimeError(f'{last} {hint}') if hint else last
+        return last
 
     size = dest.stat().st_size
     rep.log(f'  完成（{size / 1024 / 1024:.2f} MB）')
     if size < 100_000:
-        raise RuntimeError('下载内容异常偏小，可能是错误页面')
+        # 镜像有时会返回一张「仓库不存在 / 请稍后再试」的 HTML 错误页
+        return RuntimeError('下载内容异常偏小，可能是错误页面')
+    return None
 
 
 def _sha256_of(path: Path) -> str:
@@ -419,20 +578,63 @@ def _compose_wide_bind() -> str:
     return f'"{UPSTREAM_PORT}:{UPSTREAM_PORT}"'
 
 
-def _compose_bound_bind() -> str:
-    return f'"127.0.0.1:{UPSTREAM_PORT}:{UPSTREAM_PORT}"'
+def _upstream_bind_host() -> str:
+    """宿主机上发布上游端口时使用的地址（issue #243）。
+
+    默认 `127.0.0.1`（仅本机）。但管理端跑在容器里、通过
+    `WB2API_BASE=http://host.docker.internal:7863` 连上游时，宿主机回环对
+    容器**不可达**（Linux 上尤其明确）；把端口收敛到 127.0.0.1 会让更新后
+    面板一直提示「上游不可用」。
+
+    这种部署下改为绑定 `host.docker.internal` 解析出的宿主机网桥地址
+    （如 172.17.0.1 / 172.18.0.1）：容器可达，且不是公网地址。
+    Docker Desktop 的 192.168.65.0/24 是虚拟机内部地址，宿主并不拥有，
+    仍用 127.0.0.1（Desktop 会把它转发给宿主回环）。
+
+    `WB_UPSTREAM_BIND` 可显式覆盖（如只绑内网网卡 `192.168.1.10`）。
+    """
+    explicit = (os.environ.get('WB_UPSTREAM_BIND') or '').strip()
+    if explicit:
+        return explicit
+    base = (os.environ.get('WB2API_BASE') or '').strip()
+    if not base:
+        return '127.0.0.1'
+    try:
+        parts = urllib.parse.urlsplit(base if '//' in base else f'http://{base}')
+        host = (parts.hostname or '').lower()
+    except ValueError:
+        return '127.0.0.1'
+    if host != 'host.docker.internal':
+        return '127.0.0.1'
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError:
+        return '127.0.0.1'
+    if not ip or ip.startswith('127.') or ip.startswith('192.168.65.'):
+        return '127.0.0.1'
+    return ip
+
+
+def _compose_bound_bind(host: str | None = None) -> str:
+    return f'"{host or _upstream_bind_host()}:{UPSTREAM_PORT}:{UPSTREAM_PORT}"'
 
 
 def _port_converged(text: str) -> str:
-    """把 compose 文本里的公网端口绑定收敛为仅本机（纯文本替换，不落盘）。"""
-    return text.replace(_compose_wide_bind(), _compose_bound_bind())
+    """把 compose 文本里的公网端口绑定收敛为仅本机/容器网桥（纯文本替换）。"""
+    new = _compose_bound_bind()
+    for old in (_compose_wide_bind(),
+                f'"0.0.0.0:{UPSTREAM_PORT}:{UPSTREAM_PORT}"',
+                f'"127.0.0.1:{UPSTREAM_PORT}:{UPSTREAM_PORT}"'):
+        text = text.replace(old, new)
+    return text
 
 
 def enforce_local_bind(rep: Reporter) -> None:
-    """把 compose 的端口绑定收敛为仅本机。
+    """把 compose 的端口绑定收敛到安全地址。
 
-    upstream 仓库里是 `7863:7863`（公网可达）；我们的安全基线要求
-    `127.0.0.1:7863:7863`。每次更新后都要重新施加，否则会悄悄回退。
+    upstream 仓库里是 `7863:7863`（公网可达）；我们的基线要求只绑本机。
+    容器经 host.docker.internal 访问时，绑宿主网桥地址（issue #243），
+    否则容器连不上；每次更新后都要重新施加，否则会悄悄回退。
     """
     compose = UPSTREAM_DIR / 'docker-compose.yml'
     if not compose.is_file():
@@ -441,39 +643,39 @@ def enforce_local_bind(rep: Reporter) -> None:
     text = compose.read_text(encoding='utf-8')
     bound = _compose_bound_bind()
     if bound in text:
-        rep.log('端口绑定已是仅本机（127.0.0.1）')
+        rep.log(f'端口绑定已是 {_upstream_bind_host()}（安全基线）')
         return
-    if _compose_wide_bind() in text:
+    if any(old in text for old in (_compose_wide_bind(),
+                                   f'"0.0.0.0:{UPSTREAM_PORT}:{UPSTREAM_PORT}"',
+                                   f'"127.0.0.1:{UPSTREAM_PORT}:{UPSTREAM_PORT}"')):
         compose.write_text(_port_converged(text), encoding='utf-8')
         rep.log(f'已将端口绑定收敛为 {bound}（安全基线）')
     else:
         rep.log('未匹配到端口绑定行，请人工确认 compose 配置', 'warn')
 
 
-def _compose_looks_customized(rep: Reporter) -> bool:
-    """compose 文件里是否存在**除我们端口收敛之外**的用户改动。
+def _normalize_eol(raw: bytes) -> bytes:
+    """文本内容的 CRLF → LF；二进制原样返回（issue #202）。
 
-    判据：把本地文件反向还原端口收敛后，与 git HEAD 里的版本比对——
-    不相同就说明用户自己改过（加网络、改卷、加环境变量…）。
+    为什么必须在这一步归一：随包分发的上游源码是在 Windows 上打的包，**包内就带
+    CRLF**（实测 293/298 个文件）。同步是字节拷贝，于是宿主源码树、进而网关镜像里的
+    脚本首行变成 `#!/usr/bin/env bash\\r` —— 解释器路径对不上，一键登录 / 签到 / 积分
+    这些依赖脚本的功能整体失效。
 
-    为什么要单独判断：端口收敛是我们**故意**制造的本地改动，每次更新都会
-    重新施加，不该被当成「用户定制」而一直保留旧文件。只有真正的用户定制
-    才需要保住（issue #28：1Panel 用户加了 external 网络，被 git reset 抹掉后
-    容器重建连不上网络）。
+    判据与报告方本地兜底一致：**能按 UTF-8 解码且不含 NUL** 的当文本，其余（图片、
+    压缩包等）一个字节都不动。猜错方向的代价是把二进制改坏，比行尾问题严重得多，
+    所以宁可漏归一一个奇怪的文本，也不碰任何可能非文本的东西。
+
+    顺带解决第二件事：内容只差行尾的文件此前会被算成「有改动」→ 白等一次网关重建
+    （报告方实测：不归一 295 个文件全算改动，归一后只报 7 改写 + 2 新增）。
     """
-    compose = UPSTREAM_DIR / 'docker-compose.yml'
-    if not compose.is_file():
-        return False
+    if b'\x00' in raw:
+        return raw
     try:
-        local = compose.read_text(encoding='utf-8')
-        rc, head = run(['git', 'show', 'HEAD:docker-compose.yml'],
-                       cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            return False  # 取不到 HEAD 版本就不下结论，按「没定制」处理（维持旧行为）
-        # 两边都归一化到「收敛后」再比，排除掉端口这一处已知差异
-        return _port_converged(local).strip() != _port_converged(head).strip()
-    except Exception:  # noqa: BLE001
-        return False
+        raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return raw
+    return raw.replace(b'\r\n', b'\n')
 
 
 def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
@@ -482,14 +684,13 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
     返回**改动文件数**（改写的 + 新增的）；0 表示没变或本次不适用——
     调用方据此决定要不要重建上游容器（源码没变就不该白等一次构建）。
 
-    上游仓库的公开地址已不可用，源码随面板的 Release 包分发（包内 `upstream/`）。
-    在这里同步而不是在 `update_upstream` 里另下载一份，是因为**包是验过签的**：
-    上游代码由此与面板走同一条下载与校验路径；而 `update_upstream` 的 git 拉取
-    没有这层保证（也正因为上游仓库已不可访问，包里这份才是可靠来源）。
+    上游源码由本项目维护，随管理端 Release 分发（包内 `upstream/`）。在这里
+    同步而不是另拉一个仓库，是因为**包是验过签的**：上游代码与面板走同一条
+    下载与校验路径，不存在第二个更新源。
 
     三条克制：
-      · 只处理**非 git** 的上游目录 —— git 部署有自己的通道（拉远端），那份源码
-        可能比包内的新，拿包内的覆盖它是倒退；
+      · git 目录也同步：外部上游已停止维护，本地 git 历史不再作为更新来源；
+        仍保留 `config.json` / `auths/` / `data/` 和用户自定义的 compose；
       · 顶层 `config.json` / `auths/` / `data/` 一律不动（api_key、账号凭据、运行数据）；
       · 只增改、不删除：包里没有的文件保留原地（宁可留旧文件，也不误删用户的）。
     """
@@ -497,13 +698,12 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
     if not incoming.is_file():
         rep.log('本次包内未含上游源码（upstream/），跳过上游代码同步')
         return 0
+    UPSTREAM_DIR.mkdir(parents=True, exist_ok=True)
     if not (UPSTREAM_DIR / 'docker-compose.yml').is_file():
-        rep.log(f'{UPSTREAM_DIR} 里还没有上游源码，跳过同步'
-                '（首次安装上游请用 deploy/install.sh，它会用包内的 upstream/）', 'warn')
-        return 0
+        rep.log(f'{UPSTREAM_DIR} 里还没有上游源码，按发布包完整写入')
     if (UPSTREAM_DIR / '.git').is_dir():
-        rep.log('上游是 git 部署：由上面的 git 流程更新，不覆盖包内源码')
-        return 0
+        rep.log('检测到上游目录是 git 部署：外部仓库已停更，本次按发布包内源码同步；'
+                '本地 git 历史不再作为更新来源', 'warn')
 
     # 用户对 compose 的定制（加网络 / 改卷 / 改端口之外的东西）要保住。
     # 没有 git 可比，就拿「包内那份」当基准：两边都归一化掉我们的端口收敛，
@@ -530,20 +730,49 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
             continue
         dst = UPSTREAM_DIR / rel
         try:
+            incoming = _normalize_eol(f.read_bytes())
             if dst.is_file():
-                if dst.read_bytes() == f.read_bytes():
+                if dst.read_bytes() == incoming:
                     continue
+                # 注意：**内容一致、只差行尾**时也要重写（changed 照计）——已经带 CRLF
+                # 更新过的机器，本地脚本是坏的（容器里执行不了），只比原始字节会两边
+                # 都是 CRLF、被判成「没变」，于是永远修不回来。归一遍之后，下次更新
+                # 就真的「没变」了。
                 changed += 1
             else:
                 added += 1
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(f, dst)
-            shutil.copymode(f, dst)
+            # 先写临时文件再原子替换：中途断电/被杀不会留下半个 .go 文件（网关构建
+            # 会因此直接失败），也不会让容器读到半截脚本。
+            tmp = dst.with_name(dst.name + '.wbtmp')
+            tmp.write_bytes(incoming)
+            shutil.copymode(f, tmp)
+            os.replace(tmp, dst)
         except OSError as exc:
             rep.log(f'  同步 {rel} 失败：{exc}', 'warn')
 
     if keep_compose is not None:
         local_compose.write_text(keep_compose, encoding='utf-8')
+    # 标记文件是面板判断「本机上游是否已同步」的唯一依据。它没写进去时，
+    # 上面所有文件都可能已经同步成功，但界面仍会一直提示不一致（issue #240
+    # 的现场就是这类：目录不是持久化挂载，或写权限不足）。这里把它单独验一遍。
+    src_id = src / '.upstream-id'
+    if src_id.is_file():
+        try:
+            want = src_id.read_text(encoding='utf-8').strip()
+            got = (UPSTREAM_DIR / '.upstream-id').read_text(encoding='utf-8').strip() \
+                if (UPSTREAM_DIR / '.upstream-id').is_file() else ''
+            if want and got != want:
+                rep.log(
+                    f'上游标识未能更新：{UPSTREAM_DIR}/.upstream-id '
+                    f'仍是 {got[:8] or "缺失"}，应为 {want[:8]}。'
+                    '请确认该目录已从宿主机挂载且容器用户可写；'
+                    '否则面板会一直提示「随包上游与本机不一致」。',
+                    'error')
+            else:
+                rep.log(f'上游标识已同步：{want[:8]}')
+        except OSError as exc:
+            rep.log(f'核对上游标识失败：{exc}', 'warn')
     if changed or added:
         rep.log(f'上游源码已随包更新：改写 {changed} 个、新增 {added} 个文件')
     else:
@@ -551,159 +780,25 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
     return changed + added
 
 
-def _fetch_failed_hint(out: str, pinned: str = '') -> str:
-    """拉取上游失败时给用户的话——分清「远端没了」与「网络/引用有问题」。
-
-    上游原仓库（Sliverkiss/workbuddy2api）自 2026-09-23 起已不可访问。
-    git 在这种情况下的报错是 `Repository not found` / `could not read from remote`，
-    直接透出去容易被当成网络抖动，用户会反复重试同一个必然失败的地址。
-    """
-    low = (out or '').lower()
-    # 注意别写成「repo**sitory** not found」这种连在一起的写法：git 的原文是
-    # `repository 'https://…' not found`，中间夹着地址，连写匹配不上（头一版就栽在这）。
-    gone = (re.search(r'repository .*not found', low) is not None
-            or 'does not appear to be a git repository' in low
-            or 'could not read from remote repository' in low)
-    target = f'上游 {pinned}' if pinned else '上游'
-    if gone:
-        return (f'{target}的远端仓库取不到代码（发布包分发的那份不受影响）。\n'
-                '  本次沿用现有源码继续。要更新上游代码：管理端一键更新会带上包内那份；\n'
-                '  也可以把 WB_UPSTREAM_REPO 指向你自己的副本，或用 UPSTREAM_SRC 换一份源码\n'
-                '  （见 deploy/README.md 的「上游源码从哪来」）。')
-    return (f'{target}拉取失败（提交/标签是否存在？网络是否正常？）'
-            + (f'：{out.strip()[:200]}' if out.strip() else ''))
-
-
 def update_upstream(rep: Reporter) -> None:
-    rep.step('更新上游 workbuddy2api')
+    """同步发布包内自带的上游源码，并在有变化时重建容器。
 
-    if not (UPSTREAM_DIR / '.git').is_dir():
-        # 随包分发的上游：源码就在发布包里（原仓库已不可用），所以这条路径**也要取包**
-        # —— 与 update_manager 共用同一次下载与解压，`--target both` 不会下两遍。
-        #
-        # 早先这里直接 return，于是「全部更新」在管理端已是最新时什么都不做：包里带着
-        # 更新的上游源码，却同步不进去（管理端那条路径在版本相同时先短路返回了）。
-        new_root, _info = _release_root(rep)
-        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
-        if changed:
-            # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），同步会盖掉
-            # 端口收敛，所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
-            enforce_local_bind(rep)
-            rep.log('上游源码有变化，重建容器使其生效…')
-            rebuild_upstream(rep)
-        else:
-            rep.log('上游源码与包内一致，无需重建')
-        return
+    上游已由本项目维护，没有独立的远端仓库/分支；无论本地目录是不是 git
+    部署，包内 `upstream/` 都是唯一更新源。管理端与上游共用同一次下载与
+    解压（`--target both` 不会下两遍）。
+    """
+    rep.step('同步随包上游')
 
-    which = shutil.which('git')
-    if not which:
-        raise RuntimeError('未安装 git，无法更新上游')
-
-    # 1) 若存在本地改动，先备份再暂存，避免 pull 冲突
-    rc, status = run(['git', 'status', '--porcelain'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-    dirty = [l for l in status.splitlines() if l.strip()]
-    # compose 的用户定制要**单独留存**：更新会用 git reset --hard 抹掉工作区，
-    # 而 patch 备份（下面那个 .patch 文件）只是给人看的，不会自动还原。
-    # 见 issue #28：1Panel 用户给上游 compose 加了 external 网络，
-    # 更新后被抹掉 → 容器重建时网络配置丢失、连不上。
-    custom_compose = _compose_looks_customized(rep)
-    saved_compose = ''
-    if custom_compose:
-        try:
-            saved_compose = (UPSTREAM_DIR / 'docker-compose.yml').read_text(encoding='utf-8')
-            rep.log('检测到 docker-compose.yml 有本地定制，更新后会原样恢复'
-                    '（网络 / 卷 / 端口等配置不会丢）')
-        except OSError as exc:
-            rep.log(f'读取本地 docker-compose.yml 失败，无法保留定制：{exc}', 'warn')
-            custom_compose = False
-    if dirty:
-        rep.log(f'检测到 {len(dirty)} 处本地改动，先备份')
-        backup = DATA_DIR / 'upstream-local-changes.patch'
-        rc, diff = run(['git', 'diff'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if diff.strip():
-            backup.write_text(diff, encoding='utf-8')
-            rep.log(f'  已备份到 {backup}')
-        # 丢弃本地改动：其中包含我们的端口收敛与（已单独留存的）compose 定制，
-        # 前者稍后重新施加，后者在更新完成后原样写回
-        run(['git', 'checkout', '--', '.'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-
-    # 2) 拉取（或检出被固定的版本）
-    pinned = _read_upstream_ref()
-    before = ''
-    rc, out = run(['git', 'rev-parse', 'HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-    if rc == 0:
-        before = out.strip()[:8]
-
-    if pinned:
-        rep.log(f'已固定上游版本：{pinned}（不跟随分支）')
-        rc, out = run(['git', 'fetch', '--depth', '1', 'origin', pinned],
-                      cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            # 浅克隆有时取不到任意提交，退回完整 fetch 再试
-            rep.log('按提交直接拉取失败，尝试完整拉取…', 'warn')
-            rc, out = run(['git', 'fetch', 'origin'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            raise RuntimeError(_fetch_failed_hint(out, pinned))
-        rc, out = run(['git', 'reset', '--hard', 'FETCH_HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            rc, out = run(['git', 'reset', '--hard', pinned], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            raise RuntimeError(f'检出上游 {pinned} 失败')
+    new_root, _info = _release_root(rep)
+    changed = _sync_bundled_upstream(new_root / 'upstream', rep)
+    if changed:
+        # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），同步会盖掉
+        # 端口收敛，所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
+        enforce_local_bind(rep)
+        rep.log('上游源码有变化，重建容器使其生效…')
+        rebuild_upstream(rep)
     else:
-        rep.log('拉取上游最新代码…')
-        rc, out = run(['git', 'fetch', '--depth', '1', 'origin'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            # 拉不到不致命：下面会沿用现有代码继续重建容器（本地源码是好的）。
-            # 但**原因要如实说**——原先一律写「网络问题？」，而上游原仓库
-            # 2026-09-23 起不再可用，用户照那句话去查网络只会白费功夫。
-            rep.log(_fetch_failed_hint(out), 'warn')
-        branch = 'master'
-        rc, out = run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        cur = out.strip() if rc == 0 else ''
-        if rc == 0 and cur and cur != 'HEAD':
-            branch = cur
-        else:
-            # 之前固定过版本会处于游离 HEAD，先切回分支再 pull
-            run(['git', 'checkout', '-f', branch], cwd=UPSTREAM_DIR, rep=rep, check=False)
-
-        rc, out = run(['git', 'pull', '--ff-only', 'origin', branch], cwd=UPSTREAM_DIR, rep=rep, check=False)
-        if rc != 0:
-            rep.log('fast-forward 失败，尝试硬重置到远端（本地改动已备份）', 'warn')
-            run(['git', 'reset', '--hard', f'origin/{branch}'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-
-    after = ''
-    rc, out = run(['git', 'rev-parse', 'HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
-    if rc == 0:
-        after = out.strip()[:8]
-    if before and after and before == after:
-        rep.log(f'上游已是最新（{after}）')
-    else:
-        rep.log(f'上游代码更新：{before or "?"} → {after or "?"}')
-
-    # 3) 恢复用户对 compose 的本地定制（issue #28）
-    #
-    # 必须在 enforce_local_bind **之前**：那份定制里可能也有端口行，
-    # 先恢复再统一收敛，才不会漏掉它。
-    if custom_compose and saved_compose:
-        try:
-            (UPSTREAM_DIR / 'docker-compose.yml').write_text(saved_compose, encoding='utf-8')
-            rep.log('已恢复本地定制的 docker-compose.yml')
-        except OSError as exc:
-            rep.log(f'恢复 docker-compose.yml 失败：{exc}', 'warn')
-            rep.log('  你的定制仍保存在本次更新的备份 patch 里，可手动恢复', 'warn')
-
-    # 4) 恢复安全基线
-    enforce_local_bind(rep)
-
-    # 5) 预检 + 重建 + 等待就绪（见 rebuild_upstream）
-    rebuild_upstream(rep)
-
-    # 6) 清版本检测缓存
-    #
-    # 缓存里存的是「更新前」查到的远端最新提交；不清的话，界面会把**已经装好的
-    # 这个版本**当成新版本继续提示「上游有更新」，一直到缓存 6 小时过期为止
-    # （用户报过这个问题：明明更新到最新了，面板还是一直说有更新）。
-    # 管理端更新那条路径早就清了，上游这条一直漏着。
+        rep.log('上游源码与包内一致，无需重建')
     _clear_version_cache(rep)
 
 
@@ -728,7 +823,7 @@ def rebuild_upstream(rep: Reporter) -> None:
         for m in missing:
             rep.log(f'  缺少 {m}', 'error')
         rep.log('这是上游代码本身的问题（不是你配置的问题）。'
-                '可在「设置 → 系统更新」把上游固定到上一个可用提交，或等待上游修复。', 'error')
+                '可用上一版管理端发布包重装回退，或等维护者修复后发布新版。', 'error')
         raise RuntimeError('上游 Dockerfile 引用了不存在的文件：' + ', '.join(missing))
 
     # 6) 重建并启动
@@ -895,17 +990,6 @@ def _sync_deploy(new_deploy: Path, install_dir: Path, backup: Path,
     return added, modified
 
 
-def _read_upstream_ref() -> str:
-    """要固定的上游版本（提交号/标签）。环境变量优先，其次本地文件；空 = 跟随分支。"""
-    env = (os.environ.get('WB_UPSTREAM_REF') or '').strip()
-    if env:
-        return env
-    try:
-        return UPSTREAM_REF_FILE.read_text(encoding='utf-8').strip()
-    except Exception:  # noqa: BLE001
-        return ''
-
-
 def _missing_copy_sources() -> list[str]:
     """列出 Dockerfile 里 COPY 引用了、但仓库中并不存在的本地文件。
 
@@ -995,7 +1079,7 @@ def _diagnose_build_failure(out: str) -> str:
     low = (out or '').lower()
     if 'not found' in low and ('checksum' in low or 'copy' in low):
         return ('上游 Dockerfile 引用了仓库里不存在的文件——这是上游代码的问题，'
-                '不是你配置的问题。可把它固定到上一个可用提交后重试')
+                '不是你配置的问题。可回滚到上一版管理端发布包后重试')
     if 'no space left' in low:
         return '磁盘空间不足，请清理后重试'
     if any(k in low for k in ('dial tcp', 'i/o timeout', 'temporary failure', 'connection refused')):
@@ -1171,6 +1255,11 @@ def fetch_release_via_redirect(latest_url: str | None = None,
     用户打满，表现为偶发 HTTP 403；而 github.com 的网页端与
     releases/download 资产下载不受该配额限制。资产名按发布惯例
     workbuddy-manager-<tag>.tar.gz 构造（历届 Release 均如此）。
+
+    **这条路径不走镜像**（issue #216）：gh-proxy 一类加速服务只放行资源下载，
+    对网页正文直接返回 403（「Web page content is not allowed」）。镜像模式下的
+    主路径是 API（镜像可代理 api.github.com），只有 API 完全不可用时才落到这里，
+    那时直连 github.com 本来就是唯一选择。
     """
     repo = repo or MANAGER_REPO
     req = urllib.request.Request(
@@ -1277,14 +1366,69 @@ _release_cache: tuple[Path, dict] | None = None
 _release_tmp: tempfile.TemporaryDirectory | None = None
 
 
+def read_package_version(archive: Path) -> str:
+    """从发布包里读出 `.version`（只解那一个成员，不展开整包）。
+
+    两条路径都用到它：离线升级包要靠它拿版本号（不查 GitHub），面板上传时也用
+    它回显「包内版本」。读 64 字节足够（里面就是 `v1.0.86` 这种短串）。
+    """
+    try:
+        with tarfile.open(archive, 'r:gz') as tf:
+            for member in tf:
+                name = member.name.replace('\\', '/')
+                if name.count('/') == 1 and name.endswith('/.version'):
+                    fh = tf.extractfile(member)
+                    return fh.read(64).decode('utf-8', 'replace').strip() if fh else ''
+    except (OSError, tarfile.TarError) as exc:
+        raise RuntimeError(
+            f'升级包读不了（{exc}）—— 确认它是发布页面下载的 .tar.gz，且下载完整') from exc
+    return ''
+
+
+def offline_package_info(rep: Reporter) -> dict:
+    """离线升级包的元信息（不联网）。
+
+    版本号取自包内 `.version` 而不是文件名：文件名谁都能改，而 `.version` 是
+    打包时写进去的（面板侧也按同一份读，两边口径一致）。
+    """
+    archive = Path(OFFLINE_PACKAGE)
+    if not archive.is_file():
+        raise RuntimeError(f'找不到离线升级包：{archive}')
+    size = archive.stat().st_size
+    if size < 100_000:
+        raise RuntimeError('离线升级包过小，不像是完整的发布包（下载可能中断了）')
+    version = read_package_version(archive)
+    if not version:
+        raise RuntimeError('离线升级包里没有 .version —— 不是本项目的发布包，已中止')
+    rep.log(f'使用离线升级包：{archive.name}（{size / 1024 / 1024:.1f} MB，包内版本 {version}）')
+    if not OFFLINE_PACKAGE_SHA256:
+        rep.log('未提供发布页 sha256：本次只校验包能不能解开、内容结构对不对，'
+                '包本身的可信度取决于你从哪拿到它', 'warn')
+    return {
+        'tag': version,
+        'pkg_url': '',
+        'pkg_name': archive.name,
+        'pkg_size': None,          # 没有独立的「期望大小」（文件就在本机）
+        'pkg_digest': f'sha256:{OFFLINE_PACKAGE_SHA256}' if OFFLINE_PACKAGE_SHA256 else '',
+        'local_package': str(archive),
+    }
+
+
 def _fetch_release_info(rep: Reporter) -> dict:
     """取最新 Release 的元信息（**不下载**）。同一进程内只查一次。
 
     API 优先（认证后 5000 次/小时；未认证仅 60 次/小时/IP，共享出口极易被同出口
     用户打满而 403）；失败时回退到 releases/latest 的 302 重定向（不走 API、无配额）。
+
+    指定了离线升级包（`WB_UPDATE_PACKAGE`）时不联网：内网机器上这条路本来就是
+    为了「完全拿不到 GitHub」才存在的。
     """
     global _release_info_cache
     if _release_info_cache is not None:
+        return _release_info_cache
+
+    if OFFLINE_PACKAGE:
+        _release_info_cache = offline_package_info(rep)
         return _release_info_cache
 
     info: dict | None = None
@@ -1300,6 +1444,13 @@ def _fetch_release_info(rep: Reporter) -> dict:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f'获取 Release 失败：API {api_error}；回退路径也失败：{exc}') from exc
+    elif GITHUB_MIRROR:
+        # 经 API 拿到的是**原始** GitHub 地址；下载时由 download() 自己决定
+        # 先走镜像还是直连，这里不改写（保持 info 与发布页一致，便于人工核对）。
+        if _mirror_fallback_error:
+            rep.log(f'镜像不可用（{_mirror_fallback_error}），本次版本检测走的是直连', 'warn')
+        else:
+            rep.log(f'已配置 GitHub 镜像：{GITHUB_MIRROR}（下载失败会自动回退直连）')
 
     _release_info_cache = info
     return info
@@ -1324,7 +1475,14 @@ def _release_root(rep: Reporter, info: dict | None = None) -> tuple[Path, dict]:
     _release_tmp = tempfile.TemporaryDirectory(prefix='wbm-update-')
     tmp = Path(_release_tmp.name)
     archive = tmp / info['pkg_name']
-    download(info['pkg_url'], archive, rep)
+    local = str(info.get('local_package') or '')
+    if local:
+        # 离线升级包：文件就在本机，复制一份到临时目录只是让后续步骤共用同一条
+        # 路径（解压、清理都在 tmp 里，不动用户上传的那份原件）。
+        shutil.copyfile(local, archive)
+        rep.log('离线升级包已就位（跳过下载）')
+    else:
+        download(info['pkg_url'], archive, rep)
     verify_download(archive, info, rep)
 
     rep.log('解压…')
@@ -1351,6 +1509,45 @@ def _cleanup_release_cache() -> None:
         _release_tmp = None
 
 
+def swap_dir(incoming: Path, target: Path) -> None:
+    """用 incoming 目录**原子替换** target（同目录 staging + os.replace）。
+
+    为什么不能 rmtree + copytree：复制中途失败（磁盘满、权限、被杀）会留下不完整的
+    server/，服务再也起不来，而备份不会自动恢复。这里先把新内容完整复制到
+    `target.new`，成功后再交换；交换失败会把旧目录换回去。
+
+    注意：覆盖粒度是**整个目录**，所以调用方给的 incoming 必须是完整的一份
+    （发布包解压出来的那份），不能是增量。
+    """
+    target = Path(target)
+    old = target.with_name(target.name + '.old')
+    staging = target.with_name(target.name + '.new')
+    # 清理上次中断留下的残留（它们已不可信）
+    for stale in (old, staging):
+        shutil.rmtree(stale, ignore_errors=True)
+    shutil.copytree(incoming, staging)
+    had_old = target.exists()
+    if had_old:
+        try:
+            os.replace(target, old)
+        except OSError as exc:
+            # 容器重建后 /app/server 位于 overlayfs 的 lowerdir，对目录 rename(2)
+            # 会返回 EXDEV（issue #225）。退化为「复制成备份 + 删除原目录」：
+            # 备份完整，后续换入/回滚逻辑不变。
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copytree(target, old)
+            shutil.rmtree(target)
+    try:
+        os.replace(staging, target)
+    except Exception:
+        if had_old and old.exists():
+            os.replace(old, target)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
 def update_manager(rep: Reporter) -> None:
     rep.step('更新管理端')
 
@@ -1358,13 +1555,17 @@ def update_manager(rep: Reporter) -> None:
     #    _fetch_release_info；上游那条路径也走它，所以回退只修一处。
     info = _fetch_release_info(rep)
     tag = info['tag']
-    rep.log(f'最新版本：{tag or "(未知)"}')
+    rep.log(('升级包版本：' if info.get('local_package') else '最新版本：') + f'{tag or "(未知)"}')
     rep.set_target_version(tag)
 
     current = read_local_version()
-    if current and tag and current == tag.lstrip('v'):
+    if not info.get('local_package') and current and tag and current == tag.lstrip('v'):
         rep.log(f'当前已是最新版本（{tag}）')
         return
+    if info.get('local_package'):
+        # 离线包是用户**显式指定**的：即使版本号与当前相同也继续装（重装/修复
+        # 正是它最常见的用法之一），所以这里不套用上面的「已是最新就跳过」。
+        rep.log('离线升级包：按你指定的包安装，不比较版本新旧')
 
     pkg_name = info['pkg_name']
     pkg_url = info['pkg_url']
@@ -1372,6 +1573,28 @@ def update_manager(rep: Reporter) -> None:
     # 2) 取包（下载 + 校验大小/摘要 + 解压）。与 update_upstream 共用同一次：
     #    `--target both` 时只下一次、只解压一次（上游源码也在包里）。
     new_root, info = _release_root(rep, info)
+
+    # 本次发布带了不同的上游：manager 也不能只换面板，否则「面板升级、上游
+    # 还是旧代码」会静默错配（issue #217）。旧部署没有 .upstream-id，按
+    # 「未知 = 需要同步」处理；想保留自定义上游可设 WB_SYNC_UPSTREAM=0。
+    new_up_id = ''
+    try:
+        new_up_id = (new_root / 'upstream' / '.upstream-id').read_text(
+            encoding='utf-8').strip()
+    except OSError:
+        pass
+    local_up_id = ''
+    try:
+        local_up_id = (UPSTREAM_DIR / '.upstream-id').read_text(encoding='utf-8').strip()
+    except OSError:
+        pass
+    if new_up_id and new_up_id != local_up_id:
+        if os.environ.get('WB_SYNC_UPSTREAM', '').strip() == '0':
+            rep.log('本次发布包含上游更新，但 WB_SYNC_UPSTREAM=0：只更新面板，'
+                    '上游保持现状。', 'warn')
+        else:
+            rep.log(f'本次发布包含上游更新（{new_up_id[:12]}），先同步上游并重建容器…', 'warn')
+            update_upstream(rep)
 
     new_server = new_root / 'server'
     new_web_out = new_root / 'web' / 'out'
@@ -1397,17 +1620,15 @@ def update_manager(rep: Reporter) -> None:
         shutil.copytree(INSTALL_DIR / 'web' / 'out', backup / 'web-out', dirs_exist_ok=True)
 
     rep.log('替换 server/')
-    shutil.rmtree(INSTALL_DIR / 'server', ignore_errors=True)
-    shutil.copytree(new_server, INSTALL_DIR / 'server')
+    swap_dir(new_server, INSTALL_DIR / 'server')
     # 清掉旧字节码，避免加载到过期模块
     for pc in (INSTALL_DIR / 'server').rglob('__pycache__'):
         shutil.rmtree(pc, ignore_errors=True)
 
     rep.log('替换 web/out/')
     target_web = INSTALL_DIR / 'web' / 'out'
-    if target_web.is_dir():
-        shutil.rmtree(target_web, ignore_errors=True)
-    shutil.copytree(new_web_out, target_web)
+    target_web.parent.mkdir(parents=True, exist_ok=True)
+    swap_dir(new_web_out, target_web)
 
     # deploy/ 里的脚本**默认随包更新**（`WB_SYNC_DEPLOY=0` 可关掉）。
     #
@@ -1649,6 +1870,9 @@ def main() -> int:
 
     rep = Reporter(args.target)
     rep.log(f'开始更新（target={args.target}，安装目录={INSTALL_DIR}）')
+    if GITHUB_MIRROR:
+        # 日志里出现它很重要：镜像不是「隐身加速」，用户得知道流量经过了第三方
+        rep.log(f'GitHub 镜像已启用：{GITHUB_MIRROR}（凭据不会发给镜像）')
     if PROXY_UNSUPPORTED:
         # 只报协议名，不回显地址（里面通常带用户名与密码）
         scheme = PROXY_UNSUPPORTED.split('://', 1)[0]

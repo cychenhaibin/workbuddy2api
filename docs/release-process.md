@@ -6,9 +6,9 @@
 
 ## 上游停更之后
 
-- **发版前不再需要查上游**：没有新提交可对。`deploy/check-upstream.sh` 仍可运行，
-  它会明确告诉你「上游仓库已不可访问，这一步不再需要」并以 0 退出
-  （把 `UPSTREAM_REPO` 指向你自己的副本时，它照旧按老规矩检查）。
+- **发版前不再查外部上游**：上游由本项目维护，没有独立的远端提交可对。
+  `deploy/check-upstream.sh` 只提示这一点并以 0 退出；需要验证的是补丁与
+  Go 测试，不是 git 提交。
 - **源码从哪来**：维护者手上留存了一份**最后版本的源码归档**（HEAD 快照，
   287 个文件，含 `LICENSE`）。它是完整的、可构建的；但原克隆是 blob-less
   部分克隆，**逐版本历史无法完整还原**，所以归档以「单次导入提交」的形式保存，
@@ -26,6 +26,40 @@
 - **改动上游代码**：改本地那份源码（`/opt/workbuddy2api`），
   然后 `docker compose up -d --build`。改的是别人的 MIT 代码，需保留其
   `LICENSE` 与版权声明。
+
+### 我们自己改上游的那条路（补丁 + 重打包）
+
+上游停更之后，「上游代码的改动」都由我们提出并留在 `dev/upstream-patches/*.patch`
+里，**补丁是唯一事实来源**；本地改完就直接改源码目录的那种做法不再用于需要随包的
+功能（那样改动只存在于某个人的机器上，下次重打包就丢了）。
+
+1. 改代码：从**当前 `upstream-src` 资产**解开一份干净树（`tar xzf` 即可，别在
+   本地运行目录上改），在里面写改动与 Go 用例；
+2. 出补丁：`git init` 一个只含基线的仓库 → 改完 `git add -N` 新文件 → `git diff`
+   存成 `dev/upstream-patches/000N-<名字>.patch`（**含测试文件**，0001/0003 都是这个
+   体例；后续补丁只描述自己的增量，不要重述前面几个补丁）；
+3. 验补丁：在一份**未被该补丁改动过**的资产基线上 `git apply --check` 通过、
+   `apply_upstream_patches.py` 报 `applied:`、再跑一次报 `already applied:`。
+   源码树里会生成 `.wb2a-patches.json`（补丁名 → 字节哈希）：后续补丁改写前面补丁的
+   新增行时（0009 → 0010 就是），按内容判定会误报「没打」，清单记录的是事实；
+4. 重打包：`dev/pack_fixed_upstream_src.py <那份树> -o <输出> --stamp '<一句话>'`
+   —— 它会按序号依次应用全部补丁（已应用的会跳过），再打成 `workbuddy2api-src.tar.gz`；
+5. 验收：解开新包 `go build ./...` + `go test ./...`（必要时加 `-race`）、
+   包内 `scripts/` 的 Python 用例，然后
+   `gh release upload upstream-src <包> --clobber` 覆盖载体 Release；
+6. 记录：上传后核对资产的 **size 与 sha256** 与本地一致，并把「基线摘要 → 产出摘要」
+   写进该功能自己的 docs（如 `docs/random-daily-tasks.md`、`docs/credit-exhausted-cooldown.md`）。
+
+**顺序要求**：重打包必须在**当次面板发版之前**完成 —— CI 是从载体 Release 取
+`upstream/` 塞进发布包的，晚一步设备装到的就还是旧上游。面板侧只加字段不算完成：
+旧上游会忽略未知字段，用户会看到「保存成功但没生效」。
+
+**CI 的发布门禁**（2.2.1 起）：发布作业会把随包上游当成一次真实构建来验 ——
+`apply_upstream_patches.py` 必须报「补丁数 = 文件数，且没有现场新应用的」，
+然后 `go build ./...`、`go test ./...`、对**补丁动过的文件**跑 `gofmt -l`，
+并校验 `server/main.py` 的 `version=` 与 tag 一致。以前只跑 Python 测试，
+上游补丁的缺陷可以一路进 Release。
+
 - **`adapt(upstream)` 提交**：有可访问的上游代码要跟时照旧写——把核对过的上游
   提交号写进提交信息，供下次对照。
 
@@ -170,7 +204,17 @@ bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz
 tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5      # 抽查包结构
 #    再解开看 .version 与 server/main.py 的版本号
 
-# 5) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
+# 5) 给旧版更新器补过渡签名（v1.0.85 及更早仍强制验签；私钥只在维护者本机）
+cd /tmp/vX.Y.Z
+ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
+gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
+  --repo ithtelab/workbuddy-manager
+#    验一下再继续（用仓库里记录的公钥，或 update.py 里内嵌的那把）：
+#    printf 'release %s\n' "$(cat ~/.ssh/workbuddy-release.pub)" > allowed_signers
+#    ssh-keygen -Y verify -f allowed_signers -I release -n file \
+#      -s workbuddy-manager-vX.Y.Z.tar.gz.sig < workbuddy-manager-vX.Y.Z.tar.gz
+
+# 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
 gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
@@ -179,9 +223,16 @@ gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 直接把 Release 公开发布，产物还在上传时点「一键更新」就会拿到半成品或 404。现在
 用户侧看到的一直是上一个**已发布且产物齐全**的版本。
 
-2026-10-14 起**不再有「维护者离线签名」这一步**：更新器只核对发布页给的 sha256 与
-文件大小（发布说明里就印着那个哈希，工作流自动附上）。为什么取消、还剩下哪些保证、
-老版本怎么过渡，见 [release-signing.md](release-signing.md)。
+2026-10-14 起**新版本更新器不再要求签名**：只核对发布页给的 sha256 与文件大小
+（发布说明里就印着那个哈希，工作流自动附上）。但 `.sig` 仍要按第 5 步手工补 ——
+停在 v1.0.85 及更早的更新器强制验签，漏掉就会让这批老部署无法升级。为什么这样
+过渡、私钥如何保管，见 [release-signing.md](release-signing.md)。
+
+## 发布包字节的可复现性
+
+CI 打包时固定了文件排序、mtime 与属主，并让 gzip 不写时间戳（`gzip -n`）。同一份
+暂存内容重复打包会得到同一个 sha256 —— 这是发布说明里的哈希能作为承诺的前提。
+改打包命令时不要退回普通的 `tar czf`（它会把构建时刻与属主写进字节流）。
 
 ## 发布包里放哪些文档
 

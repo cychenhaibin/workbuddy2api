@@ -194,7 +194,6 @@ class ApiTokenTest(unittest.TestCase):
         cases = [
             ('post', '/api/logs/clear', None),
             ('post', '/api/system/update', {'target': 'manager'}),
-            ('post', '/api/system/upstream-ref', {'ref': ''}),
             ('post', '/api/security/logs/clear', None),
             ('post', '/api/users', {'username': 'x', 'password': '12345678', 'role': 'viewer'}),
             # 评审补：这条同样是「重启上游容器」，与 /api/restart 同一个动作 ——
@@ -282,6 +281,9 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/security/rules',
         'POST /api/sessions/revoke',
         'POST /api/settings/upstream',
+        # 离线升级包（issue #153）：上传的是**可执行的代码包**，且下一步就是落盘重启
+        'POST /api/system/update-package',
+        'DELETE /api/system/update-package',
         # 代理线路与全局出口代理（设置 → 代理）：能改「谁的流量从哪个出口出去」，
         # 而且是**凭据载体**（地址里带用户名密码）—— 泄露的 token 不该能读能写。
         'POST /api/proxy-routes',
@@ -292,11 +294,13 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/proxy-routes/{name}/auto-assign',
         'PUT /api/settings/proxy-pool',
         'POST /api/proxy-routes/probe',
+        # Upstash 连通性测试：会拿**已保存的 Token** 向外部发请求（审计 2026-10-18），
+        # 泄露的 token 不该能借它探测 / 外带凭据。
+        'POST /api/settings/upstash/test',
         'PUT /api/settings/proxy',
         'POST /api/settings/proxy/probe',
         'POST /api/settings/upstash/reload',   # 评审补：与 /api/restart 同动作
         'POST /api/system/update',
-        'POST /api/system/upstream-ref',
         'POST /api/task-logs/clear',
         'POST /api/tokens',
         'POST /api/users',
