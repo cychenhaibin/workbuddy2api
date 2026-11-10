@@ -309,5 +309,148 @@ class WindowsPythonIsolationTest(unittest.TestCase):
                               f'{name} 没加载 python-env.ps1，无法继承 PYTHONNOUSERSITE')
 
 
+class WindowsHostSettingsTest(unittest.TestCase):
+    """issue #368：启动器里保存的监听地址不能被 prepare 每次启动重置。
+
+    现场：Windows 安装版把 IP 改成 0.0.0.0 保存，重启/开机自启后又变回 127.0.0.1，
+    局域网访问时好时坏。根因是 prepare.ps1 无条件把 0.0.0.0 改写成回环地址。
+    模板默认已经是 127.0.0.1，不需要这条「迁移」；它只会覆盖用户设置。
+    """
+
+    def test_prepare_does_not_reset_user_host(self) -> None:
+        src = (_ROOT / 'windows' / 'prepare.ps1').read_text(encoding='utf-8-sig')
+        self.assertNotIn("WB_MANAGER_HOST=127.0.0.1", src,
+                         'prepare.ps1 仍在改写 WB_MANAGER_HOST，用户保存的 0.0.0.0 会被重置')
+
+    def test_service_tools_uses_env_host(self) -> None:
+        """监听地址必须来自 .env，才能在保存后真正生效。"""
+        src = (_ROOT / 'windows' / 'service-tools.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("WB_MANAGER_HOST", src)
+        self.assertIn("'--host', $bindHost", src)
+
+
+class WindowsAutostartProjectTest(unittest.TestCase):
+    """issue #388：开机自启不能只驻留托盘，还要能按偏好自动启动项目。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_preference_is_persisted_and_gated(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('autostart_project', src)
+        self.assertIn('_chkAutostartProject.Enabled = _chkAutostart.Checked', src,
+                      '「同时启动项目」必须在未勾开机自启时禁用')
+
+    def test_boot_starts_project_quietly(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('StartProject(true)', src,
+                      '开机自启没有调用静默启动')
+        self.assertIn('_openBrowserOnHealthy = !quiet', src,
+                      '静默启动不该自动打开浏览器')
+        self.assertIn('if (quiet) { AppendLog', src,
+                      '静默启动出错时不该弹模态框')
+
+class WindowsAutostartTest(unittest.TestCase):
+    """issue #269：Windows 启动器开机自启（HKCU Run + 静默到托盘 + 卸载清理）。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_uses_current_user_run_key(self) -> None:
+        """当前用户 Run 键即可，不需要管理员权限；不能写 HKLM。"""
+        src = self._src('Autostart.cs')
+        self.assertIn(r'Software\Microsoft\Windows\CurrentVersion\Run', src)
+        self.assertIn('Registry.CurrentUser', src)
+        self.assertNotIn('Registry.LocalMachine', src)
+
+    def test_silent_argument_is_tray(self) -> None:
+        self.assertIn('--tray', self._src('Autostart.cs'))
+        self.assertIn('Autostart.SilentArgument', self._src('Program.cs'))
+
+    def test_hidden_start_does_not_show_then_hide(self) -> None:
+        """静默启动必须拦住 SetVisibleCore，不能先 Show 再 Hide（会闪窗口）。"""
+        src = self._src('MainForm.cs')
+        self.assertIn('protected override void SetVisibleCore(bool value)', src)
+        self.assertIn('base.SetVisibleCore(false)', src)
+        self.assertIn('CreateHandle()', src)
+
+    def test_tray_failure_falls_back_to_window(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('_startHidden = false;', src,
+                      '托盘初始化失败时必须回退为显示窗口（否则既无窗口也无托盘）')
+
+    def test_uninstall_removes_autostart(self) -> None:
+        src = self._src('UninstallForm.cs')
+        self.assertIn('Autostart.DisableIfOwned(_installDir)', src,
+                      '卸载要清理开机自启，否则卸载后仍会自启')
+
+
+class WindowsLauncherUpdateTest(unittest.TestCase):
+    """issue #288：启动器检查最新 Release、下载并校验安装包。
+
+    不做端到端下载（需要网络与 42MB 安装包），但把安全不变量钉在源码里：
+      · 只查本仓库的 `releases/latest`；
+      · 只接受 HTTPS 资产；
+      · 必须先校验 `.sha256` 再启动安装程序；
+      · 启动前必须让用户确认，且不能静默覆盖。
+    """
+
+    def _src(self) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / 'MainForm.cs'
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_checks_this_repo_latest_release(self) -> None:
+        src = self._src()
+        self.assertIn('api.github.com/repos/ithtelab/workbuddy-manager/releases/latest', src)
+        self.assertIn('WorkBuddyManagerSetup.exe', src)
+
+    def test_requires_https_and_sha256_before_running(self) -> None:
+        src = self._src()
+        self.assertIn('Uri.UriSchemeHttps', src)
+        self.assertIn('VerifySha256', src)
+        self.assertIn('.sha256', src)
+        # 校验失败必须中止，且提示里要说明「未运行安装程序」
+        self.assertIn('未运行安装程序', src)
+
+    def test_user_confirms_before_download(self) -> None:
+        src = self._src()
+        self.assertIn('MessageBoxButtons.YesNo', src)
+        self.assertIn('是否下载并安装', src)
+
+    def test_honors_update_proxy(self) -> None:
+        """国内网络访问 GitHub 时复用服务器的 WB_UPDATE_PROXY 约定。"""
+        self.assertIn('WB_UPDATE_PROXY', self._src())
+
+    def test_update_entry_points_exist(self) -> None:
+        src = self._src()
+        self.assertIn('OnCheckUpdate', src)
+        self.assertIn('检查更新', src)
+
+
+class WindowsConsoleEncodingTest(unittest.TestCase):
+    """issue #306：UTF-8 控制台（Beta「Unicode UTF-8 全球语言支持」）下不能按 GBK 解码。"""
+
+    def _src(self) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / 'ServiceGate.cs'
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_uses_console_output_encoding(self) -> None:
+        src = self._src()
+        self.assertIn('ConsoleOutputEncoding()', src,
+                      '脚本输出必须按当前控制台编码解码，不能写死 OEM 代码页')
+        self.assertIn('Console.OutputEncoding', src)
+
+    def test_falls_back_to_oem_when_console_missing(self) -> None:
+        src = self._src()
+        self.assertIn('OEMCodePage', src,
+                      '取不到控制台编码时应退回 OEM 代码页（无控制台启动的旧行为）')
+
+
 if __name__ == '__main__':
     unittest.main()

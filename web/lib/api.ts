@@ -7,8 +7,12 @@ import type {
   AccountsResponse,
   RefreshPlan,
   DailyPlan,
+  TaskSchedulerStatus,
+  TaskSchedulerApply,
   DailyTask,
   CreditsFlow,
+  AccountUsageResponse,
+  AccountModelUsageResponse,
   ApiKey,
   ApiToken,
   AuditLogPage,
@@ -26,6 +30,9 @@ import type {
   CreditExpiry,
   CreditsMeta,
   DrawResult,
+  AccountBackfillInfo,
+  AutoUpdateConfig,
+  AutoUpdateInfo,
   GithubMirror,
   IpAccessLog,
   IpRule,
@@ -35,6 +42,7 @@ import type {
   KeyImportStatus,
   Me,
   ModelCatalog,
+  PricingInfo,
   ModelListResponse,
   Page,
   PgSyncConfig,
@@ -42,6 +50,7 @@ import type {
   PgSyncStatus,
   PgSyncTestResult,
   PlaygroundModels,
+  ProbeModelsResponse,
   RedPacket,
   RedPacketDetail,
   RedPacketKind,
@@ -64,6 +73,18 @@ import type {
   UsagePoint,
   UserItem,
   Versions,
+  WatchdogConfigResponse,
+  WatchdogEgress,
+  WatchdogLlmConfig,
+  WatchdogMailConfig,
+  WatchdogMailTest,
+  WatchdogQqBotsResult,
+  WatchdogQqConfig,
+  WatchdogQqTest,
+  WatchdogRunResult,
+  WatchdogSaveResult,
+  WatchdogStatus,
+  WatchdogVerdict,
 } from './types';
 
 export const http = axios.create({
@@ -163,8 +184,27 @@ export const authApi = {
 const groupQs = (upstreamId?: number | null): string =>
   upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
 
+export interface AccountRiskEvent {
+  id: string; uid: string; nickname: string; group: string; realm: string;
+  operation: string; http_status: number; ts: number; historical: boolean;
+  acknowledged: boolean; paused: boolean | null; action_error: string;
+  pause_until: number; needs_review: boolean; failures: number;
+}
+
+export const accountRiskApi = {
+  list: (realm: string, upstreamId: number | null = null, allGroups = false, includeAcknowledged = false) =>
+    get<{items: AccountRiskEvent[]; failed_groups: string[]; total: number}>('/api/account-risk',
+      {realm, upstream_id: upstreamId ?? undefined, all_groups: allGroups, include_acknowledged: includeAcknowledged}),
+  resume: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/resume`),
+  acknowledge: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/acknowledge`),
+};
+
 export const accountApi = {
   proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
+  /** 上游「账号管理接口」（admin.enabled）开关状态；供解禁队列判断能否真的解封。
+   *  非默认分组返回 null（面板读不到那套实例的 config.json）。 */
+  adminApiStatus: (upstreamId?: number | null) =>
+    get<{enabled: boolean | null}>('/api/accounts/admin-api-status' + groupQs(upstreamId)),
   setProxy: (filename: string, proxy: string, upstreamId?: number | null) =>
     put<{ok: boolean; proxy: string; reload_triggered: boolean}>(
       `/api/accounts/${encodeURIComponent(filename)}/proxy` + groupQs(upstreamId), {proxy}),
@@ -314,6 +354,10 @@ export const accountApi = {
   refresh: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string}>(
       `/api/accounts/${encodeURIComponent(file)}/refresh${groupQs(upstreamId)}`),
+  /** 账号 × 模型主动探测（issue #270）：files 为账号文件名，models 为模型 id。 */
+  probeModels: (files: string[], models: string[], upstreamId?: number | null) =>
+    post<ProbeModelsResponse>(`/api/accounts/probe-models${groupQs(upstreamId)}`,
+                              {accounts: files, models}),
   /** 一键刷新所有账号的 accessToken（真实续期，末尾只重载一次上游） */
   refreshAllTokens: (upstreamId?: number | null) =>
     post<{
@@ -337,6 +381,11 @@ export const accountApi = {
   dailyPlan: () => get<DailyPlan>('/api/accounts/daily-plan'),
   saveDailyPlan: (plan: DailyPlan) =>
     put<DailyPlan>('/api/accounts/daily-plan', plan),
+  /** 上游与面板两套调度的重叠状态（issue #375） */
+  taskScheduler: () => get<TaskSchedulerStatus>('/api/accounts/task-scheduler'),
+  /** 只保留一套调度；panel 会写上游 config 并触发重载 */
+  keepTaskScheduler: (keep: 'upstream' | 'panel') =>
+    put<TaskSchedulerApply>('/api/accounts/task-scheduler', {keep}),
   /** 立即执行一次某个每日任务（不等定时） */
   runDailyTask: (task: DailyTask) =>
     post<{ok: boolean; message: string; task: string; plan: DailyPlan}>(
@@ -372,8 +421,11 @@ export const accountApi = {
    * 调用上游自带的 scripts/task_runner.py。full（点亮）会伪造活跃上报，
    * 因此单独要求 confirm，与幂等的 claim 区分开。 */
   taskRunStatus: () => get<TaskRunStatus>('/api/task-run'),
-  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false) =>
-    post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
+  /** upstreamId 选分组（issue #274）：null/省略 = 默认分组的账号目录。 */
+  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false,
+                 upstreamId: number | null = null) =>
+    post<{ok: boolean; message: string}>('/api/task-run',
+      {mode, target, confirm, upstream_id: upstreamId}),
   taskRunStop: () => post<{ok: boolean; message: string}>('/api/task-run/stop'),
 
   /* ── 定时领奖配置：**后端有、前端有意不做 UI** ───────────────
@@ -398,7 +450,7 @@ export const accountApi = {
 export const upstreamApi = {
   /** 上游运行状态。upstreamId 非空时查**该分组**的实例（多账号池）。 */
   status: (upstreamId?: number | null) =>
-    get<UpstreamStatus>('/api/status',
+    get<UpstreamStatus>('/api/upstream/status',
                         upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 上游模型简表；realm 非空时只返回该版本的条目 */
   models: (realm?: Realm) => get<ModelListResponse>('/api/models', {realm}),
@@ -456,6 +508,15 @@ export const keyApi = {
   update: (id: number, body: Partial<ApiKey>) => patch<ApiKey>(`/api/keys/${id}`, body),
   remove: (id: number) => del<{ok: boolean}>(`/api/keys/${id}`),
   resetUsage: (id: number) => post<{ok: boolean}>(`/api/keys/${id}/reset-usage`),
+  /**
+   * 取回一把已创建密钥的明文（「再复制一次」）。
+   *
+   * 面板现在把明文也存了一份（只为这一下；网关校验仍走哈希）。这条接口要求
+   * **会话管理员**，且每次调用都写一条审计日志——列表只回前缀，只能在这里拿。
+   * 存量密钥（保存明文之前的版本）回 409，界面据此提示「需要重新建一把」。
+   */
+  reveal: (id: number) => post<{id: number; name: string; prefix: string; key: string}>(
+    `/api/keys/${id}/reveal`),
   /**
    * 检查模型白名单里哪些名字匹配不到已知模型（issue #46）。
    *
@@ -585,13 +646,22 @@ export const tokenApi = {
 export const logApi = {
   list: (params: Record<string, unknown>) => get<Page<RequestLog>>('/api/logs', params),
   clear: () => post<{ok: boolean}>('/api/logs/clear'),
+  /** 账号列的自诊断：日志从哪读、读到几行、为什么可能是空的（issue #232） */
+  accountBackfill: () => get<AccountBackfillInfo>('/api/logs/account-backfill'),
 };
 
 /* ── 用量统计 ───────────────────────────────────────── */
+/** 自定义日期范围（issue #257）：两端都含；与 days 同时传时后端优先用日期。 */
+export interface StatsRange {
+  start?: string;
+  end?: string;
+}
+
 export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
-  daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  daily: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsagePoint[]>('/api/stats/daily', {days, realm, ...range}),
   /**
    * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
    * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
@@ -600,12 +670,18 @@ export const statsApi = {
     get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
 
   /** 积分收支（收入 / 支出）按天聚合 + 今日 / 近 7 天合计 */
-  creditsFlow: (days = 30, realm?: Realm) =>
-    get<CreditsFlow>('/api/stats/credits', {days, realm}),
-  byModel: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
-  byKey: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
+  creditsFlow: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<CreditsFlow>('/api/stats/credits', {days, realm, ...range}),
+  byModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm, ...range}),
+  byKey: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm, ...range}),
+  /** 按「日期 × 账号」聚合（issue #402）；同一范围解析规则 */
+  byAccount: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountUsageResponse>('/api/stats/by-account', {days, realm, ...range}),
+  /** 按「账号 × 模型」聚合（issue #369） */
+  byAccountModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountModelUsageResponse>('/api/stats/by-account-model', {days, realm, ...range}),
   /**
    * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
    * 且是自上游进程启动以来的累计（没有时段概念）。
@@ -684,6 +760,11 @@ export const settingsApi = {
   /** 立即重启上游（一般无需手动调用，保存配置会自动重载） */
   reloadUpstream: () =>
     post<{ok: boolean; message: string}>('/api/settings/upstash/reload'),
+  /** 计费价目表（issue #380）：版本、生效档、覆盖情况、节假日缺口 */
+  pricing: () => get<PricingInfo>('/api/settings/pricing'),
+  /** 保存覆盖价目；传 null 恢复成随版本分发的那份 */
+  savePricing: (body: Record<string, unknown> | null) =>
+    put<PricingInfo>('/api/settings/pricing', body),
   modelMap: () => get<Record<string, string>>('/api/settings/model-map'),
   saveModelMap: (body: Record<string, string>) =>
     post<Record<string, string>>('/api/settings/model-map', body),
@@ -697,6 +778,50 @@ export const settingsApi = {
     patch<UserItem & {sessions_revoked?: boolean; relogin_required?: boolean}>(
       `/api/users/${encodeURIComponent(username)}`, body),
   removeUser: (username: string) => del<{ok: boolean}>(`/api/users/${encodeURIComponent(username)}`),
+};
+
+/* ── 页面监控（watchdog）──────────────────────────────── */
+/**
+ * 上游网页改版监控：配置 / 状态 / 立即检测 / 基线 / 邮件出口 / 测试发信。
+ *
+ * 全部要求管理员 —— 状态里有账号昵称与收件地址，配置里有 LLM 地址与打码凭据。
+ * 「立即检测」是同步返回的：一轮是几次页面抓取 + 一两个只读查询，正常几秒内
+ * 结束，界面可以直接把结果写出来，不用再引入一套任务轮询。
+ */
+export const watchdogApi = {
+  config: () => get<WatchdogConfigResponse>('/api/watchdog/config'),
+  /** 只传要改的段即可；打码值 `********` 表示保持原密码/密钥不变 */
+  saveConfig: (body: Record<string, unknown>) =>
+    put<WatchdogSaveResult>('/api/watchdog/config', body),
+  status: () => get<WatchdogStatus>('/api/watchdog/status'),
+  /**
+   * 一轮可能是「页面 25s + 资源预算 40s + LLM 60s」，超过全局 60s 上限——
+   * 超时只影响这一次等待，后端仍会跑完并落库；但界面会显示一条失败，
+   * 用户会以为没检测。这里单独放宽到 4 分钟。
+   */
+  run: async () => (await http.post<WatchdogRunResult>(
+    '/api/watchdog/run', {}, {timeout: 240000})).data,
+  /** 清掉全部基线：下次检测只重建指纹，不告警（改版后误报时用） */
+  resetBaseline: () =>
+    post<{ok: boolean; cleared: number; message: string}>('/api/watchdog/baseline', {}),
+  /**
+   * 三个「测试」都接受表单当前值（不必先保存）：用户填完 SMTP 主机就会点
+   * 检测，要求先保存再测试等于把一步藏在别处。未传 body 时后端用已保存配置。
+   */
+  checkEgress: (mail?: Partial<WatchdogMailConfig>) =>
+    post<WatchdogEgress>('/api/watchdog/mail/egress', mail ?? {}),
+  testMail: (mail?: Partial<WatchdogMailConfig>) =>
+    post<WatchdogMailTest>('/api/watchdog/mail/test', mail ?? {}),
+  /** 检测 AstrBot 地址 / 密钥 / scope，并列出可用平台适配器（拼 UMO 用） */
+  qqBots: (qq?: Partial<WatchdogQqConfig>) =>
+    post<WatchdogQqBotsResult>('/api/watchdog/qq/bots', qq ?? {}),
+  /** 发一条 QQ 测试消息（同样用表单当前值，不要求先保存） */
+  testQq: async (qq?: Partial<WatchdogQqConfig>) =>
+    (await http.post<WatchdogQqTest>(
+      '/api/watchdog/qq/test', qq ?? {}, {timeout: 60000})).data,
+  testLlm: async (llm?: Partial<WatchdogLlmConfig>) =>
+    (await http.post<{ok: boolean; verdict: WatchdogVerdict}>(
+      '/api/watchdog/llm/test', llm ?? {}, {timeout: 120000})).data,
 };
 
 export type {Account};
@@ -716,6 +841,10 @@ export const systemApi = {
   githubMirror: () => get<GithubMirror>('/api/settings/github-mirror'),
   saveGithubMirror: (mirror: string) =>
     put<GithubMirror>('/api/settings/github-mirror', {mirror}),
+  /** 自动更新：定时检测，在时间窗内自动执行一键更新 */
+  autoUpdate: () => get<AutoUpdateInfo>('/api/settings/auto-update'),
+  saveAutoUpdate: (cfg: AutoUpdateConfig) =>
+    put<AutoUpdateInfo>('/api/settings/auto-update', cfg),
   /**
    * 启动一键更新；target: manager | upstream | both。
    * source='uploaded' 用面板里已上传的离线升级包（issue #153）。

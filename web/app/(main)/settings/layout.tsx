@@ -21,6 +21,7 @@ import {
   FileText,
   KeyRound,
   Route,
+  Radar,
 } from 'lucide-react';
 import {usePathname} from 'next/navigation';
 import {notify} from '@/lib/toast';
@@ -54,6 +55,8 @@ import {PgSyncPanel} from '@/components/common/settings/PgSyncPanel';
 import {ProxyPanel} from '@/components/common/settings/ProxyPanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
+import {WatchdogPanel} from '@/components/common/settings/WatchdogPanel';
+import {PricingPanel} from '@/components/common/settings/PricingPanel';
 import {UpstreamReloadNotice} from '@/components/common/settings/UpstreamReloadNotice';
 import {CopyButton} from '@/components/ui/copy-button';
 import {Button} from '@/components/ui/button';
@@ -232,7 +235,7 @@ const SCHEDULE_FIELDS: Field[] = [
     key: 'account_delay_max_seconds',
     kind: 'num',
     label: '账号最长间隔',
-    desc: '自动任务的账号随机间隔上限；两项填 0 保持原有间隔。开启后同一时刻的不同任务也依次运行，手动执行不受影响',
+    desc: '适用于上游自动任务、管理端每日计划和令牌续期；两项填 0 保持原行为，手动执行不受影响',
     unit: '秒',
     min: 0,
     max: 600,
@@ -242,7 +245,7 @@ const SCHEDULE_FIELDS: Field[] = [
     key: 'random_delay_minutes',
     kind: 'num',
     label: '每日任务随机延迟',
-    desc: '每天各类任务在原定整点后随机延迟 0～N 分钟；0 表示整点执行。同一天重启沿用原时刻，手动执行不受影响',
+    desc: '上游每天各类任务在原定整点后随机延迟 0～N 分钟；0 表示整点执行。同一天重启沿用原时刻，不改变管理端每日计划',
     unit: '分钟',
     min: 0,
     max: 60,
@@ -398,6 +401,16 @@ const POOL_FIELDS: Field[] = [
     // 不一致会出现「JSON 里能设、表单编辑时被拒」的矛盾。
     max: 64,
     def: 2,
+  },
+  {
+    key: 'credit_floor',
+    kind: 'num',
+    label: '保底积分',
+    desc: '账号可用积分低于该值时不再选它，换用其他账号；只有全部账号都低于保底时才会继续用。余额未同步的账号不参与判断，0 = 关闭',
+    unit: '积分',
+    min: 0,
+    max: 1000000,
+    def: 0,
   },
   {
     key: 'breaker_threshold',
@@ -605,6 +618,22 @@ const UPSTREAM_FIELDS: Field[] = [
     kind: 'bool',
     label: '透传客户端 IP',
     desc: '是否把客户端 IP（X-Forwarded-For / X-Real-IP）透传给上游。缺省关闭——不把内网/代理 IP 暴露给上游',
+    def: false,
+  },
+  {
+    key: 'gzip_body',
+    kind: 'bool',
+    label: '压缩大请求体（gzip）',
+    desc: '超过 64 KB 的对话请求先 gzip 压缩再发给上游。服务器出口带宽窄时长上下文的'
+      + '首字节能快 20 秒以上；短对话不压缩、无额外开销。上游不接受压缩时会自动改用未压缩重发',
+    def: true,
+  },
+  {
+    key: 'http2',
+    kind: 'bool',
+    label: '出站 HTTP/2',
+    desc: '让网关向腾讯发请求时优先协商 HTTP/2。默认关闭：现行 HTTP/1.1 路径经过长期验证；'
+      + '开启前请确认流式长连接与代理线路在目标网络可用',
     def: false,
   },
 ];
@@ -929,6 +958,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
     users: {icon: <Users className="h-3.5 w-3.5" />},
     tokens: {icon: <KeyRound className="h-3.5 w-3.5" />},
     system: {icon: <DownloadCloud className="h-3.5 w-3.5" />},
+    watchdog: {icon: <Radar className="h-3.5 w-3.5" />},
     backup: {icon: <Database className="h-3.5 w-3.5" />},
     changelog: {icon: <FileText className="h-3.5 w-3.5" />},
     about: {icon: <Info className="h-3.5 w-3.5" />},
@@ -1942,6 +1972,10 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
 
         {/* ═══ 模型映射 ═══ */}
         <TabsContent value="models" className="mt-4 space-y-4">
+          {/* 计费价目（issue #380）挂在「模型管理」下面：它回答的是同一件事的
+              下半句——「这些模型用起来值多少钱」。单开一个 Tab 会改动导航清单
+              （项目把它钉死为 10 项，改数量要同步路线图与 CHANGELOG），不值得。 */}
+          <PricingPanel />
           <div className="rounded-[20px] bg-muted p-4">
             <div className="mb-1 text-sm font-medium">{t('settings.mapNewAlias')}</div>
             <div className="mb-3 text-[11px] text-muted-foreground">
@@ -2178,6 +2212,11 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
         {/* ═══ 系统更新 ═══ */}
         <TabsContent value="system" className="mt-4 space-y-4">
           <UpdatePanel />
+        </TabsContent>
+
+        {/* ═══ 页面监控 ═══ */}
+        <TabsContent value="watchdog" className="mt-4 space-y-4">
+          <WatchdogPanel />
         </TabsContent>
 
         {/* ═══ 数据备份 ═══ */}

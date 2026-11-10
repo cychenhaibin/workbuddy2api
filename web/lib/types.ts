@@ -5,7 +5,15 @@ export interface Me {
   role: Role;
 }
 
+export interface RefreshRisk {
+  until: number; last_failure_at: number; failures: number;
+  needs_review: boolean; retry_after_sec: number; paused: boolean;
+}
+
 export interface Account {
+  /** 本面板记录的添加时间（Unix 秒）；旧账号/直接拷贝的文件可能未知。 */
+  added_at?: number | null;
+  refresh_risk?: RefreshRisk | null;
   proxy?: string;
   /**
    * 手写权重（issue #187）：上游选号的**乘数**，默认 1；0 = 未设置（等价 1）。
@@ -187,6 +195,27 @@ export interface DailyPlan {
   full: DailyTaskConfig;
 }
 
+/** 上游与面板两套调度的重叠状态（issue #375）。 */
+export interface TaskSchedulerStatus {
+  upstream: {
+    available: boolean;
+    /** 上游 config.json 的 schedule.checkin_enabled */
+    checkin: boolean;
+    /** 上游 schedule.activity_enabled（内部含领取补偿） */
+    activity: boolean;
+  };
+  panel: Record<DailyTask, boolean>;
+  /** 两套都开的重叠任务：checkin / compensation */
+  conflicts: string[];
+}
+
+export interface TaskSchedulerApply {
+  plan: DailyPlan;
+  scheduler: TaskSchedulerStatus;
+  reload_scheduled: boolean | null;
+  reload_hint?: string;
+}
+
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
 export interface PoolCounts {
   total: number;
@@ -276,6 +305,8 @@ export interface ProxyProbe {
   exit_ip?: string;
   exit_info?: string;
   error?: string;
+  /** 失败时的可行动提示（协议/端口/认证/规则），原始 error 仍保留 */
+  hint?: string;
 }
 
 export interface ProxySettings {
@@ -622,9 +653,32 @@ export interface RequestLog {
   ip: string;
   model: string | null;
   mapped_model: string | null;
+  /**
+   * 思考强度（reasoning_effort）：客户端在请求体里**显式传的**档位
+   * （low / medium / high / max…，不同模型档位不同）。
+   *
+   * null = 客户端没传（走模型默认档）或该字段上线前的历史记录——界面显示「—」。
+   * 刻意不做推断：把「默认」写成某个具体档位，排查时会误判客户端行为
+   * （例如以为客户端一直在要 max）。
+   */
+  effort: string | null;
+  /**
+   * 客户端渠道（issue #233）：按 User-Agent 归类（codex / vscode / cli / wb /
+   * web / api / other / unknown）。
+   *
+   * 只用于排查「哪类客户端在把账号打进 429」，**不改变网关行为**。
+   * null = 该列上线前的历史记录（界面显示「—」）。
+   */
+  channel: string | null;
   status: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或该行在功能上线前写入，
+   * 界面显示「—」——不能显示 ¥0，那会被读成「这次调用免费」。
+   */
+  cost: number | null;
   latency_ms: number;
   /**
    * 首字延迟（毫秒）：从发起上游请求到收到第一个含正文的 delta。
@@ -666,6 +720,10 @@ export interface UsagePoint {
   completion_tokens: number;
   /** 当日实际扣费合计 */
   credit: number;
+  /** 按 DeepSeek 官方价估算的费用（元）；null = 这天没有可计价的调用 */
+  cost: number | null;
+  /** 这天里没计入费用的请求数 */
+  unpriced_requests: number;
   /**
    * 当日失败请求数（4xx + 5xx 合计）。
    *
@@ -676,6 +734,8 @@ export interface UsagePoint {
    * 可选：老版本后端不返回该字段，界面按 0 处理（不显示失败）。
    */
   failed?: number;
+  /** 当日成功请求数（2xx，issue #369 第 3 点）；同样来自 request_logs。 */
+  success?: number;
 }
 
 /**
@@ -696,6 +756,8 @@ export interface UsageHourPoint {
   credit: number;
   /** 该小时的失败请求数（来自请求日志，与 `UsagePoint.failed` 同一口径） */
   failed: number;
+  /** 该小时的成功请求数（2xx） */
+  success?: number;
 }
 
 /** 一天的积分收入 / 支出（`/api/stats/credits` 的 daily 项） */
@@ -706,6 +768,20 @@ export interface CreditsFlowPoint {
   /** 支出：调用实际扣费（usage.credit）当日合计 */
   expense: number;
   /** income - expense */
+  net: number;
+}
+
+/**
+ * 单日按小时桶（`days=1` 时后端额外返回，粒度规则与用量趋势图一致）。
+ *
+ * 固定 24 个桶补零：X 轴长度不随「今天走到几点」变化，图上不会因为还没到的
+ * 时段而抖动。
+ */
+export interface CreditsFlowHourPoint {
+  day: string;
+  hour: number;
+  income: number;
+  expense: number;
   net: number;
 }
 
@@ -724,6 +800,48 @@ export interface CreditsFlow {
   week: {income: number; expense: number; net: number};
   total: {income: number; expense: number; net: number};
   daily: CreditsFlowPoint[];
+  /** 范围只有一天时为 hour（此时带 hourly），否则 day。旧后端不返回。 */
+  granularity?: 'day' | 'hour';
+  /** 24 个小时桶；仅 granularity === 'hour' 时存在。 */
+  hourly?: CreditsFlowHourPoint[];
+}
+
+export interface AccountUsageRow {
+  day: string;
+  account: string;
+  nickname: string;
+  uid8: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageRow {
+  account: string;
+  nickname: string;
+  uid8: string;
+  model: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageResponse {
+  items: AccountModelUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
+export interface AccountUsageResponse {
+  items: AccountUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
 }
 
 export interface UsageBreakdown {
@@ -733,6 +851,14 @@ export interface UsageBreakdown {
   completion_tokens: number;
   /** 该维度实际扣费合计 */
   credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或全在该列上线前，
+   * 界面显示「—」。**不是 0**：0 会被读成「免费」。
+   */
+  cost: number | null;
+  /** 同一维度里没有计入费用的请求数（模型不在价目表 / 历史行） */
+  unpriced_requests: number;
   /**
    * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
    * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
@@ -749,6 +875,19 @@ export interface StatsSummary {
   today_credit: number;
   week_credit: number;
   total_credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 该区间内没有任何可计价的调用（与「0 元」不同，界面显示「—」）。
+   */
+  today_cost: number | null;
+  week_cost: number | null;
+  total_cost: number | null;
+  /** 同一区间内**没有**计入费用的请求数——有它才能说清金额只覆盖了一部分调用 */
+  today_unpriced: number;
+  week_unpriced: number;
+  total_unpriced: number;
+  /** 费用币种（目前只有 CNY） */
+  cost_currency: string;
   week_requests: number;
   week_tokens: number;
   total_requests: number;
@@ -966,6 +1105,8 @@ export interface TaskRunStatus {
   running: boolean;
   mode: string;
   target: string;
+  /** 执行的分组名（issue #274）；空串 = 默认分组 */
+  group?: string;
   started_at: number;
   finished_at: number;
   exit_code: number | null;
@@ -986,6 +1127,32 @@ export interface TaskRunStatus {
   schedule: {enabled?: boolean; hours?: number[]};
 }
 
+
+/** 账号 × 模型探测的单条结果（issue #270） */
+export type ProbeStatus = 'ok' | 'rate' | 'credit' | 'auth' | 'no_model' | 'error';
+
+export interface ProbeModelResult {
+  /** 探测成功且已同步网关（解除该模型 11102 误标）；上游没开管理接口时缺省 */
+  gateway_synced?: boolean;
+  /** 上游未注册管理接口（admin.enabled=false）：不是失败，只是无从同步 */
+  gateway_sync_skipped?: boolean;
+  gateway_sync_message?: string;
+  file: string;
+  uid: string;
+  nickname: string;
+  realm: string;
+  model: string;
+  status: ProbeStatus;
+  code: string | null;
+  message: string;
+  latency_ms: number;
+}
+
+export interface ProbeModelsResponse {
+  results: ProbeModelResult[];
+  summary: Record<ProbeStatus, number>;
+  requests: number;
+}
 
 /** 签到记录分页返回 */
 export interface CheckinLogPage {
@@ -1141,6 +1308,61 @@ export interface Versions {
  * GitHub 镜像（issue #216）：国内机器直连 GitHub 超时时，用加速服务取
  * Release 元信息与发布包。走镜像时**不会**发送 GitHub Token。
  */
+/**
+ * 账号列的自诊断（issue #232）。
+ *
+ * 请求日志的「账号」来自上游运行日志回填，面板转发时并不知道用了哪个号。
+ * 这一列空的时候有四种完全不同的原因，后端把事实与判断依据一起返回。
+ */
+export interface AccountBackfillInfo {
+  /** native = 日志文件；docker = docker logs；systemd = journal */
+  mode: 'native' | 'docker' | 'systemd';
+  /** native 是文件路径，docker 是容器名，systemd 是 unit 名 */
+  source: string;
+  /** 最近一次采集的时刻（epoch 秒，0 = 还没跑过） */
+  checked_at: number;
+  /** 那次读到的日志行数 */
+  lines: number;
+  /** 解析出的请求行数 */
+  parsed: number;
+  /** 成功回填到本地请求记录的行数 */
+  filled: number;
+  /** 采集抛出的异常原文（空 = 没有异常） */
+  error: string;
+  /** native: 日志文件是否存在；docker: 能否操作 docker */
+  exists: boolean;
+  /** native 的日志文件大小（字节） */
+  size?: number;
+  /** 人读的判断结论；空串表示当前没有异常 */
+  hint: string;
+}
+
+/** 自动更新设置（设置 → 更新） */
+export interface AutoUpdateConfig {
+  enabled: boolean;
+  /** 检测间隔（小时，1–168） */
+  interval_hours: number;
+  /** 允许动手的时间窗（服务器本地时间整点，[start, end)，相等 = 全天） */
+  window_start: number;
+  window_end: number;
+  /** auto：上游变了且能操作 docker 时一起更新；manager：只更新管理端 */
+  target: 'auto' | 'manager';
+}
+
+export interface AutoUpdateInfo extends AutoUpdateConfig {
+  state: {
+    last_check_at: number;
+    /** none / wait / started / error / 空 = 还没跑过 */
+    last_action: string;
+    last_message: string;
+    pending_version: string;
+  };
+  docker_ok: boolean;
+  /** 非空 = 当前部署形态不支持自动更新（如 Windows 原生），开关禁用 */
+  unsupported_reason: string;
+  server_tz_offset_minutes: number;
+}
+
 export interface GithubMirror {
   /** 生效的镜像基址（规范化后带尾斜杠）；空串 = 直连 */
   mirror: string;
@@ -1439,4 +1661,258 @@ export interface PgSyncTestResult {
   ok: boolean;
   message: string;
   server_version?: string;
+}
+
+/* ── 页面监控（watchdog）──────────────────────────────── */
+/**
+ * 监控目标。`kind` 决定「比什么」：
+ *   · `html`   —— 页面结构行（标签 + 可见文本）；
+ *   · `assets` —— 页面骨架 + 它引用的前端 bundle（JS 里的字符串与端点）。
+ *     前端发版时页面骨架往往一个字都不变，变的是 bundle 的哈希与内容——
+ *     活动入口和领取文案都在那里，所以默认目标用的是这个。
+ *   · `js` / `text` —— 目标本身就是一个 JS 文件 / 纯文本，直接比其中的字符串。
+ */
+export interface WatchdogTarget {
+  name: string;
+  url: string;
+  kind: 'html' | 'js' | 'text' | 'assets';
+  enabled: boolean;
+}
+
+/** 通知时机：任意变化 / 只有出现可领取 / 只有异常（含可领取）。 */
+export type WatchdogNotifyOn = 'change' | 'claimable' | 'anomaly';
+
+export interface WatchdogLlmConfig {
+  enabled: boolean;
+  /** OpenAI 兼容的 base url；不带 /v1 时自动补 */
+  base_url: string;
+  /** 打码值 `********` 表示保持不变 */
+  api_key: string;
+  model: string;
+  timeout_seconds: number;
+}
+
+export interface WatchdogMailConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  security: 'ssl' | 'starttls' | 'none';
+  username: string;
+  /** 打码值 `********` 表示保持不变 */
+  password: string;
+  from: string;
+  to: string[];
+  subject_prefix: string;
+}
+
+/**
+ * QQ 通知（经 AstrBot HTTP OpenAPI 中转）。
+ *
+ * 管理端不持有 QQ 官方机器人的 AppID/Secret：那是 AstrBot 的职责。这里只有
+ * 「AstrBot 在哪、用什么密钥、发给哪个会话」三样。
+ */
+export interface WatchdogQqConfig {
+  enabled: boolean;
+  /** AstrBot 地址；不带路径时自动补 `/api/v1` */
+  base_url: string;
+  /** 开发者访问密钥 `abk_...`（需 `im` scope）；打码值 `********` 表示保持不变 */
+  api_key: string;
+  /** UMO：`平台:消息类型:会话ID`，如 `qq_official:GroupMessage:<group_openid>` */
+  umo: string;
+  timeout_seconds: number;
+}
+
+export interface WatchdogConfig {
+  enabled: boolean;
+  interval_minutes: number;
+  targets: WatchdogTarget[];
+  timeout_seconds: number;
+  /** kind=assets 时最多抓几个静态资源（0 = 不抓 bundle） */
+  asset_limit: number;
+  notify_on: WatchdogNotifyOn;
+  /** 检测到变化后，逐账号只读查询「活动补偿」状态 */
+  scan_compensation: boolean;
+  /** 扫描明确可领时才真的领取（复用每日计划里的补偿任务） */
+  auto_claim: boolean;
+  /** 允许监控内网地址（默认关闭：SSRF 防护） */
+  allow_private_targets: boolean;
+  llm: WatchdogLlmConfig;
+  mail: WatchdogMailConfig;
+  qq: WatchdogQqConfig;
+}
+
+/** 单个 SMTP 端口的出口探测结果。 */
+export interface WatchdogPortProbe {
+  port: number;
+  ok: boolean;
+  banner: string;
+  error: string;
+}
+
+export interface WatchdogEgress {
+  ok: boolean;
+  host: string;
+  port?: number;
+  banner?: string;
+  error?: string;
+  ports: WatchdogPortProbe[];
+  checked_at: number;
+}
+
+/** 判读结论（LLM 或规则退化；`source=rule` 表示 LLM 未启用/失败）。 */
+export interface WatchdogVerdict {
+  layout_changed: boolean;
+  claimable: boolean;
+  anomaly: boolean;
+  confidence: number;
+  summary: string;
+  evidence: string[];
+  actions: string[];
+  source: string;
+  llm_error?: string;
+}
+
+export interface WatchdogTargetResult {
+  name: string;
+  url: string;
+  /** baseline_created = 首次建立基线（不告警） */
+  status: 'baseline_created' | 'unchanged' | 'changed' | 'error';
+  digest: string;
+  previous_digest?: string;
+  lines: number;
+  diff?: {added: number; removed: number; truncated: boolean};
+  verdict?: WatchdogVerdict;
+}
+
+export interface WatchdogScanSummary {
+  ok: boolean;
+  total?: number;
+  claimable?: number;
+  already?: number;
+  unknown?: number;
+  failed?: number;
+  error?: string;
+}
+
+export interface WatchdogRunResult {
+  ok: boolean;
+  trigger: string;
+  started_at?: number;
+  finished_at?: number;
+  targets?: WatchdogTargetResult[];
+  changed?: string[];
+  errors?: {name: string; error: string}[];
+  scan?: WatchdogScanSummary | null;
+  claim?: {ok: boolean; message: string} | null;
+  mail?: {ok: boolean; message?: string; skipped?: string} | null;
+  qq?: WatchdogQqResult | null;
+  /** 已有一次检测在运行时返回 */
+  skipped?: string;
+}
+
+export interface WatchdogQqResult {
+  ok: boolean;
+  message?: string;
+  skipped?: string;
+  error?: string;
+  /** 已发送的目标 UMO */
+  umo?: string;
+}
+
+export interface WatchdogState {
+  last_run_at?: number;
+  last_result?: WatchdogRunResult;
+  last_error?: string;
+  egress?: WatchdogEgress;
+}
+
+export interface WatchdogStatus {
+  config: WatchdogConfig;
+  state: WatchdogState;
+  /** 现在是否已到下一次检测时间 */
+  due: boolean;
+  next_run_at: number | null;
+}
+
+export interface WatchdogConfigResponse {
+  config: WatchdogConfig;
+}
+
+export interface WatchdogSaveResult {
+  config: WatchdogConfig;
+  mail_egress?: WatchdogEgress | null;
+  warning?: string;
+}
+
+export interface WatchdogMailTest {
+  ok: boolean;
+  message?: string;
+  skipped?: string;
+  egress: WatchdogEgress;
+}
+
+/** AstrBot 平台适配器（`GET /api/v1/im/bots` 的返回项）。 */
+export interface WatchdogQqBot {
+  id?: string;
+  name?: string;
+  type?: string;
+  [key: string]: unknown;
+}
+
+export interface WatchdogQqBotsResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  bots?: WatchdogQqBot[];
+}
+
+export interface WatchdogQqTest extends WatchdogQqBotsResult {
+  /** auth = 地址/密钥/scope 没过；send = 已通过鉴权，问题在 UMO 或发送 */
+  stage?: 'auth' | 'send';
+  message?: string;
+  sent_at?: number;
+  umo?: string;
+}
+
+/* ── 计费价目（issue #380）──────────────────────────────── */
+export interface PricingModelRate {
+  cache_hit?: {peak?: number; off_peak?: number};
+  cache_miss?: {peak?: number; off_peak?: number};
+  output?: {peak?: number; off_peak?: number};
+}
+
+export interface PricingVersion {
+  effective_from: string;
+  verified_at: string;
+  source: string;
+  source_note?: string;
+  holiday_source?: string;
+  models: Record<string, PricingModelRate & {label?: string}>;
+  peak_windows: number[][];
+  peak_days: number[];
+  holiday_years: string[];
+  /** 是否是管理员自己覆盖的版本（不是随版本分发的那份） */
+  overridden: boolean;
+  /** 距上次核对官方价目的天数；null = 没写核验日期 */
+  age_days: number | null;
+}
+
+/**
+ * 价目表状态。
+ *
+ * `missing_holiday_years` 非空表示**节假日安排缺这一年**：那段时间的高峰判定
+ * 会退化成「只看周几」，节假日里本来该按空闲价算的调用会被按高峰价计（高估一倍）。
+ */
+export interface PricingInfo {
+  currency: string;
+  money_unit: string;
+  versions: PricingVersion[];
+  active: Record<string, unknown> | null;
+  is_peak_now: boolean;
+  override: Record<string, unknown> | null;
+  has_override: boolean;
+  missing_holiday_years: number[];
+  stale_after_days: number;
+  aliases: Record<string, string>;
+  priced_models: string[];
 }

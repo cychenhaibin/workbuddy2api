@@ -14,6 +14,7 @@
 [![Release](https://img.shields.io/github/v/release/ithtelab/workbuddy-manager?color=22c55e&label=Release)](https://github.com/ithtelab/workbuddy-manager/releases)
 [![Changelog](https://img.shields.io/badge/更新日志-CHANGELOG-blue)](CHANGELOG.md)
 [![Issues](https://img.shields.io/github/issues/ithtelab/workbuddy-manager?color=f59e0b&label=反馈)](https://github.com/ithtelab/workbuddy-manager/issues)
+[![Stars](https://img.shields.io/github/stars/ithtelab/workbuddy-manager?color=f5c542&label=Stars)](https://github.com/ithtelab/workbuddy-manager)
 
 [English](README.en.md) · **简体中文** ｜ 本项目在 [LINUX DO](https://linux.do) 社区发布与交流
 
@@ -32,6 +33,11 @@
 **界面预览**
 
 </div>
+
+<p align="center">
+  仓库地址：<a href="https://github.com/ithtelab/workbuddy-manager">github.com/ithtelab/workbuddy-manager</a> —— 已经突破 <strong>2k Stars</strong>，感谢每一位 Star、Issue 与 PR。
+  觉得好用，欢迎点个 <a href="https://github.com/ithtelab/workbuddy-manager">Star</a> 给我们一个支持。
+</p>
 
 ---
 
@@ -121,11 +127,9 @@
 
 ## 官方下载源
 
-**只从本仓库的 [Releases](https://github.com/ithtelab/workbuddy-manager/releases) 下载。** 本项目的官方发布包提供 sha256 与 `.sig` 签名，更新器会核对它们。
+**建议从本仓库的 [Releases](https://github.com/ithtelab/workbuddy-manager/releases) 下载。** 官方发布包提供 sha256 与 `.sig` 签名，更新器会核对它们；从别处获得的包无法按这条校验链确认来源与完整性，请自行判断，并**不要为此跳过摘要或签名校验**（`WB_SKIP_SIGNATURE=1` 等）。
 
-近期有第三方账号在 issue 里引导用户到 `github.com/AEmbers/workbuddy-manager` 下载所谓 `v2.8.4` / `v2.8.5`，并声称“已独立接手本项目”。该 fork 未获得本项目授权，构建也没有本项目的离线签名，无法按官方校验链确认来源和完整性。**不要为了安装第三方包设置 `WB_SKIP_SIGNATURE=1` 或跳过摘要校验。**
-
-如果已经在第三方包上登录过面板或填写过上游账号，建议轮换面板管理员密码和上游账号授权，然后重新安装官方发布包。
+本项目以 MIT 许可开源，欢迎任何人在许可证范围内使用、修改与分发；出现其他来源的构建属于正常现象，请以本仓库的发布说明与校验值为准。
 
 ---
 
@@ -144,6 +148,10 @@
 3. 之后用桌面快捷方式打开控制台：点 **启动项目**，状态变「运行中」并自动打开管理面板；
    随时可 **重启 / 关闭项目**、修改监听 IP 与端口（保存后重启生效）、点 **打开面板** 回到页面。
 4. 点 X 可选「最小化到托盘」或「退出程序」（可记住选择，托盘图标随时恢复）。
+5. 需要「开机即驻留」时，在控制窗口勾选 **开机自动启动（静默驻留托盘）**：写入当前用户
+   的启动项（HKCU，无需管理员），下次登录不显示窗口、只驻留托盘；卸载时会自动清理。
+6. 需要升级时点控制窗口的 **检查更新**：查询本仓库最新 Release，下载安装包并用发布页
+   的 SHA-256 校验，校验通过后启动安装向导（`.env`、账号与 `data` 保留）。
 
 > 默认成功构建的单文件安装包内置全部运行环境（Python 运行时、上游网关、前端页面），
 > 目标机器**无需安装任何依赖**，Windows 10 (1903+) / 11 双击即用。当前安装器没有
@@ -155,7 +163,8 @@
 **② Docker（自己起容器）**
 
 ```bash
-docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
+# 端口只绑本机：公网访问请走反向代理（HTTPS + 访问控制），直接暴露管理面风险高
+docker run -d --name workbuddy-manager -p 127.0.0.1:7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
 ```
 
 **③ 服务器一键脚本（装依赖、拉包、配 systemd）**
@@ -190,6 +199,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `POST` | `/v1/messages/count_tokens` | 网关密钥 | 按字符数粗估输入 token |
 | `GET` | `/v1/models` | 网关密钥 | 模型列表 |
 | `GET` | `/v1/usage` | 网关密钥 | 密钥自查：已用 / 剩余额度、有效期与模型范围（只读面板记录，不产生调用） |
+| `GET` | `/api/usage/token/` | 网关密钥 | 余额协议：当前密钥的剩余额度（供 new-api 客户端余额面板） |
+| `GET` | `/api/status` | 无 | 余额协议公开元数据：只声明数值单位，不含额度 |
+| `GET` | `/api/upstream/status` | 会话 | 上游运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
 | `GET` | `/healthz` | 无 | 存活探测（含上游连通性） |
 | `GET` | `/api/me` | 会话 | 当前登录用户 |
 | `POST` | `/api/login` `/api/logout` | 无 | 登录 / 登出 |
@@ -212,7 +224,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 ## 安全说明
 
-- 密钥只在创建时显示一次，库里只存哈希；账号凭据不返回前端
+- 密钥用哈希校验，明文只在创建时展示一次、之后仅管理员可在密钥页再查看 / 复制（逐次记审计）；账号凭据不返回前端
 - 入站 IP 白 / 黑名单（支持 CIDR）、每把密钥的 IP 与模型白名单
 - 敏感操作全部留审计日志（谁、什么时候、做了什么）
 - 发布包校验：一键更新会核对发布页给的 sha256 与文件大小，不符即拒绝安装
@@ -225,6 +237,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 ## 已知限制
 
 - **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和上游后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
+- **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，反代没有对应入口。
 - 请求的**请求体 / 响应体内容不做留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。
 - 用量统计按「天 × 密钥 × 模型」聚合；如需小时粒度可扩展 `usage_daily` 表。
 
@@ -240,6 +253,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 - [部署指南](deploy/README.md) —— 反向代理、HTTPS、Windows 原生、一键更新
 - [账号出口线路](docs/account-proxy-routes.md) —— 每个账号走不同代理出口
 - [API 令牌](docs/api-tokens.md) —— 只读令牌与作用域
+- [页面监控](docs/watchdog.md) —— 上游网页改版检测、LLM 判读与邮件 / QQ 通知
+- [QQ 机器人通知与开放接口](docs/qq-bot.md) —— AstrBot 对接、UMO 与机器人控制边界
 
 ---
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+from contextlib import asynccontextmanager
 import json
 import os
 import re
@@ -133,6 +134,32 @@ def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
     return billing_headers(realm, auth)
 
 
+def _refresh_retry_after(resp: httpx.Response) -> int:
+    from email.utils import parsedate_to_datetime
+    raw = resp.headers.get('retry-after', '')
+    try:
+        seconds = int(raw)
+    except (ValueError, TypeError):
+        try:
+            seconds = int(parsedate_to_datetime(raw).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            try:
+                body = resp.json()
+                seconds = int(body.get('retry_after') or (body.get('retry_policy') or {}).get('retry_after') or 300)
+            except (ValueError, TypeError, AttributeError):
+                seconds = 300
+    return max(300, min(21600, seconds))
+
+
+@asynccontextmanager
+async def _risk_checked_client(client, auth: dict):
+    from . import accountrisk
+    if await accountrisk.paused(str(auth.get('uid') or ''), auth['_risk_auth_dir']):
+        raise RuntimeError('账号已保护性暂停，未向腾讯发送请求；请先检查账号预警')
+    async with client as active:
+        yield active
+
+
 def _account_http_client(auth: dict, *, lane: str = ''):
     """账号出站客户端（按账号线路选代理）。
 
@@ -146,8 +173,10 @@ def _account_http_client(auth: dict, *, lane: str = ''):
     # 多传一个空 lane 会把它们全打红，而语义上「默认车道」本来就不该有痕迹。
     extra = {'lane': lane} if lane else {}
     if proxy is None:
-        return config.http_client(config.TENCENT_TIMEOUT, connect=5, **extra)
-    return config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy, **extra)
+        client = config.http_client(config.TENCENT_TIMEOUT, connect=5, **extra)
+    else:
+        client = config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy, **extra)
+    return _risk_checked_client(client, auth) if '_risk_auth_dir' in auth else client
 
 
 def _login_net_hint(proxy_name: str, exc: Exception) -> str:
@@ -325,7 +354,21 @@ def _atomic_write_json(target: Path, payload: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         if original is not None and hasattr(os, 'chown'):
-            os.chown(tmp_name, original.st_uid, original.st_gid)
+            # 属主先对齐：跨 uid 部署（面板以 root 写、上游以 uid 10001 读）时上游
+            # 正是靠属主读文件的，这一步失败必须让调用方知道，不能静默写出一个
+            # 上游读不到的账号文件（表现为「账号加进去了但池里没有」）。
+            os.chown(tmp_name, original.st_uid, -1)
+            try:
+                # 属组只影响附加的组可读性。非 root 只能把文件改到自己所属的组，
+                # 而账号文件的属组常常是上游容器内的 gid（典型 10001）——面板在
+                # 宿主机上属于 workbuddy 组，这一行必然 EPERM。2026-10-26 实测：
+                # 目录属主、权限都正常（mkstemp 与写入都成功），只有这句失败，
+                # 用户看到「账号已授权成功，但写入账号文件失败：Operation not
+                # permitted」并被引去检查一个没问题的目录。属主已经对齐，属组失败
+                # 不影响上游读取（0600 同 uid 即可读），忽略。
+                os.chown(tmp_name, -1, original.st_gid)
+            except PermissionError:
+                pass
         os.chmod(tmp_name, (original.st_mode & 0o777) if original is not None else 0o644)
         os.replace(tmp_name, target)
     except Exception:
@@ -520,6 +563,10 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     当异常来源（上游 D3 实测）。
     """
     refresh = str(auth.get('refresh_token') or '').strip()
+    if '_risk_auth_dir' in auth:
+        from . import accountrisk
+        if await accountrisk.paused(str(auth.get('uid') or ''), auth['_risk_auth_dir']):
+            return False, '账号已保护性暂停，未发送刷新请求；请先检查账号预警；限时暂停到期自动允许重试，需人工复核时使用预警中的解除暂停', {}
     if not refresh:
         return False, '该账号没有 refreshToken（只能重新扫码或登录）', {}
 
@@ -546,6 +593,13 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
         return False, f'刷新异常: {err_text(exc)}', {}
 
     if resp.status_code >= 400:
+        if resp.status_code == 429:
+            paused = False
+            if '_risk_auth_dir' in auth:
+                from . import accountrisk
+                paused = await accountrisk.pause_refresh(str(auth.get('uid') or ''), auth['_risk_auth_dir'], retry_after=_refresh_retry_after(resp))
+            return False, ('令牌刷新接口限流（HTTP 429），不是凭证失效；'
+                           + ('已保护性暂停该账号，请查看账号预警' if paused else '请查看账号预警，暂停状态尚未确认')), {}
         # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。
         # 说清楚「该重新扫码」比让用户反复点刷新有用。
         return False, (f'刷新失败（HTTP {resp.status_code}）——'
@@ -579,11 +633,34 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     if isinstance(body.get('domain'), str) and body['domain']:
         out['domain'] = body['domain']
 
+    if '_risk_auth_dir' in auth:
+        from . import accountrisk
+        await accountrisk.note_refresh_success(uid, auth['_risk_auth_dir'])
     when = out.get('expires_at')
     if when:
         left = max(0, when - int(time.time()))
         return True, f'刷新成功，新令牌有效期 {left // 86400} 天', out
     return True, '刷新成功（上游未返回有效期，沿用原值）', out
+
+
+# 10001 的两层语义（issue #256）：上游既用它表示「今天已签到」（幂等成功），
+# 也用它表示「签到失败，请稍后重试」（瞬时限流）。只按业务码判断会把失败记成成功，
+# 所以这里再看 msg 文案区分。英文文案来自上游 i18n 版本。
+_ALREADY_CHECKIN_MARKERS = ('已签到', '已经签到', 'already checked in',
+                            'already signed in', 'already checkin')
+
+
+def is_already_checkin_message(code: int, message: str = '') -> bool:
+    """报告 (code, message) 是否表示「今天已签到」。
+
+    空消息保持旧行为（按已签到处理）：上游省略 msg 时不能把幂等成功误记成失败。
+    """
+    if code != 10001:
+        return False
+    msg = (message or '').strip().lower()
+    if not msg:
+        return True
+    return any(m in msg for m in _ALREADY_CHECKIN_MARKERS)
 
 
 async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str]:
@@ -595,6 +672,9 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
 
     access_token 可传字符串（只有 Authorization）或完整 auth dict
     （额外带上 X-User-Id 等身份头——上游 billing 域一直这么做，见 BillingHeaders）。
+
+    返回码：0 成功 / 10001 今日已签到 / -2 国际版跳过 / -3 上游瞬时拒绝
+    （10001「签到失败，请稍后重试」，可退避重试）/ -1 网络或解析异常。
     """
     if not supports_checkin(realm):
         return -2, '国际版无签到体系，已跳过'
@@ -609,7 +689,18 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
         if code == 0:
             return 0, '签到成功'
         if code == 10001:
-            return 10001, '今日已签到'
+            msg = ''
+            try:
+                env = resp.json()
+                if isinstance(env, dict):
+                    msg = str(env.get('msg') or '')
+            except Exception:  # noqa: BLE001
+                msg = ''
+            if is_already_checkin_message(code, msg):
+                return 10001, '今日已签到'
+            # 同一个 10001 的瞬时拒绝语义（issue #256 实测批量签到偶发）：
+            # 用 -3 与「已签到」区分，调用方才不会把失败记成成功。
+            return -3, msg or '签到失败，请稍后重试'
         return code, f'签到返回 code={code}'
     except Exception as exc:  # noqa: BLE001
         return -1, f'签到异常: {err_text(exc)}'
@@ -789,7 +880,8 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
             total += remain
             at = _package_expiry(item) if remain > 0 else None
             if at is not None:
-                expiries.append({'at': at, 'amount': _round_credits(remain)})
+                expiries.append({'at': at, 'amount': _round_credits(remain),
+                                'created': _package_created(item)})
         expiries.sort(key=lambda e: e['at'])
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
@@ -1150,6 +1242,21 @@ _PACKAGE_END_LAYOUT = '%Y-%m-%d %H:%M:%S'
 _PACKAGE_END_TZ = timezone(timedelta(hours=8))
 
 
+def _package_created(item: dict) -> int:
+    """套餐到账时刻（epoch 秒）。上游 CreateTime 是毫秒时间戳。
+
+    缺失/非法/非正数返回 0，调用方据此回退「采集时刻」——不能拿 0 当 1970 年。
+    """
+    raw = item.get('CreateTime')
+    if raw is None:
+        return 0
+    try:
+        ms = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return ms // 1000 if ms > 0 else 0
+
+
 def _package_expiry(item: dict) -> int | None:
     """套餐到期时刻（epoch 秒，绝对时刻）。字段缺失/空/解析失败 → None。
 
@@ -1269,16 +1376,103 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                                            '/'.join(paths) + '）—— 账号本身没问题；'
                                            '请先升级到最新版本，仍不行就把这句反馈给维护者')
                         return False, _explain_code(code, msg)
-                    # 读到首个非空数据块即可确认账号可用，无需等流结束
+                    # SSE 心跳、角色预告和 error 帧都不代表模型可用。
+                    # 只在实际输出或正常完成时成功，防止错误探测清掉网关误标。
+                    buffer = b''
                     async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            elapsed = int((_time.time() - started) * 1000)
-                            return True, f'连通正常（{model}，{elapsed}ms）'
-                    return False, '上游未返回任何数据'
+                        buffer += chunk
+                        while b'\n' in buffer:
+                            line, buffer = buffer.split(b'\n', 1)
+                            line = line.strip()
+                            if not line.startswith(b'data:'):
+                                continue
+                            raw_event = line[5:].strip()
+                            if raw_event == b'[DONE]':
+                                return False, '上游流已结束，但未返回有效模型输出'
+                            try:
+                                event = json.loads(raw_event)
+                            except (ValueError, UnicodeDecodeError):
+                                continue
+                            if not isinstance(event, dict):
+                                continue
+                            if event.get('error'):
+                                error = event['error']
+                                if isinstance(error, dict):
+                                    message = str(error.get('message') or error.get('msg') or '')
+                                    try:
+                                        nested = json.loads(message)
+                                        if isinstance(nested, dict):
+                                            error = nested
+                                    except ValueError:
+                                        pass
+                                    return False, _explain_code(error.get('code', 500),
+                                                               str(error.get('msg') or error.get('message') or ''))
+                                return False, str(error)
+                            if event.get('code') not in (None, 0, 200):
+                                return False, _explain_code(event['code'], str(event.get('msg') or ''))
+                            for choice in event.get('choices') or []:
+                                delta = choice.get('delta') or choice.get('message') or {}
+                                if any(delta.get(k) for k in ('content', 'reasoning_content', 'tool_calls')) or \
+                                        choice.get('finish_reason') in ('stop', 'length', 'tool_calls'):
+                                    elapsed = int((_time.time() - started) * 1000)
+                                    return True, f'连通正常（{model}，{elapsed}ms）'
+                        if len(buffer) > 1024 * 1024:
+                            return False, '探测响应格式异常'
+                    return False, '上游未返回有效模型输出'
         return False, '所有候选路径均不可用'
     except Exception as exc:  # noqa: BLE001
         return False, f'请求异常: {err_text(exc)}'
 
+
+
+_PROBE_CODE_RE = re.compile(r'code=([0-9][0-9-]*)')
+# 额度不足文案（与上游 ErrHardCredit 的关键词同口径，大小写不敏感）
+_PROBE_CREDIT_HINTS = ('积分不足', '额度不足', '余额不足', '积分耗尽', '积分用完',
+                       'insufficient credit', 'no credit', 'quota exceeded')
+
+
+def classify_probe_result(ok: bool, message: str) -> tuple[str, str | None]:
+    """把 `probe_account` 的 (ok, message) 映射成结构化状态（issue #270）。
+
+    状态：ok / rate / credit / auth / no_model / error。
+
+    为什么从 message 里回读业务码而不是另起一套请求实现：`probe_account`
+    已经是**唯一**的探测请求构造点（渠道校验、路径回落、请求头都在那里），
+    再复制一份必然漂移。`_explain_code` 的输出格式固定含 `code=X`，回读稳。
+    """
+    if ok:
+        return 'ok', None
+    m = _PROBE_CODE_RE.search(message or '')
+    code = m.group(1) if m else None
+    text = (message or '').lower()
+    if code == '11102':
+        return 'no_model', code
+    if code in ('12153', '401'):
+        return 'auth', code
+    if code in ('6004', '429'):
+        return 'rate', code
+    if code in ('402', '14018'):
+        return 'credit', code
+    if any(h in message for h in _PROBE_CREDIT_HINTS) or 'credit' in text:
+        return 'credit', code
+    return 'error', code
+
+
+async def probe_model(auth: dict, model: str) -> dict:
+    """账号 × 模型探测（issue #270）：在 `probe_account` 之上补结构化分类。
+
+    返回 `{status, code, message, latency_ms}`。`status='no_model'` 表示
+    「该账号没有这个模型」——账号本身没问题，不计入错误。
+    """
+    started = time.time()
+    ok, message = await probe_account(auth, model)
+    status, code = classify_probe_result(ok, message)
+    return {
+        'status': status,
+        'code': code,
+        'message': message,
+        'latency_ms': int((time.time() - started) * 1000),
+    }
 
 
 def _is_channel_check(code: object, raw: str) -> bool:

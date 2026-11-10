@@ -8,18 +8,24 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as _StarletteHTTPException
 
+import json
 import logging
 
 from . import config, db, redpacket, security
 from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
-    accounts, anthropic, auth, gateway, keys, logs, models, playground,
+    accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs, models,
+    playground,
     pgsync as pgsync_router, redpackets, responses, security as security_router,
-    proxies, settings, stats, system, tokens, upstreams,
+    proxies, settings, stats, system, tokens, upstreams, watchdog as watchdog_router,
 )
-from .services import accountlog, cooling, dailyplan, pgsync, renew, tasklog, taskrun
+from .services import (
+    accountlog, accountrisk, autoupdate, cooling, dailyplan, modelrecovery, pgsync, renew, tasklog,
+    taskrun, watchdog,
+)
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
 # 一旦出现 emoji（账号昵称就可能带）就会抛 UnicodeEncodeError —— 与「成长任务」
@@ -41,6 +47,7 @@ async def lifespan(app: FastAPI):
                      '中修改；本次生产事故的入口就是 admin123。',
                      '、'.join(weak_admins))
     _warn_if_exposed()
+    _warn_weak_upstream_key()
     # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
     # 等于那些红包只能自己发 key、没法让大家抽。
     filled = redpacket.backfill_codes()
@@ -49,6 +56,8 @@ async def lifespan(app: FastAPI):
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
+    accountrisk.initialize()
+    accountrisk.start()
     # 定时领奖（成长任务里幂等的那一半）：只把已完成任务的奖励领回来，不伪造
     # 任何活跃上报，因此可以安全地到点自动跑。点亮那半只允许手动（见 taskrun）
     taskrun.start_scheduler()
@@ -58,6 +67,7 @@ async def lifespan(app: FastAPI):
     # 强制冷却到期清理：manual_disabled 不会随 until 自动消失，不清理会让
     # 定时冷却变成永久停用（见 services/cooling.py）。
     cooling.start_scheduler()
+    modelrecovery.start_scheduler()
     # 每日任务计划（签到 / 领奖 / 做任务）：管理端自己的调度器，把「一键」动作
     # 做成每天到点自动跑。默认全部关闭，由用户在账号页显式开启（full 有风控风险）。
     dailyplan.start_scheduler()
@@ -67,19 +77,56 @@ async def lifespan(app: FastAPI):
     # PostgreSQL 定时备份（用户反馈：怕服务器暴雷丢数据）。默认关闭 ——
     # 只有配好连接、打开开关并设了间隔才会真的推数据出去。
     pgsync.start_scheduler()
+    # 上游网页改版监控：抓结构指纹 → 变化时 LLM 判读 / 查活动补偿 → 邮件上报。
+    # 默认关闭；邮件启用前会先探 SMTP 出口（出口不通就不给开）。
+    watchdog.start_scheduler()
+    # 自动更新：按「设置 → 更新」里的开关与时间窗定时检测并执行一键更新。
+    # 默认关闭；真正的更新仍走 updater.start_update（与按钮同一条路）。
+    autoupdate.start_scheduler()
     try:
         yield
     finally:
         tasklog.stop_collector()
+        accountrisk.stop()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
         cooling.stop_scheduler()
+        modelrecovery.stop_scheduler()
         dailyplan.stop_scheduler()
         accountlog.stop_collector()
         pgsync.stop_scheduler()
+        watchdog.stop_scheduler()
+        autoupdate.stop_scheduler()
         # 出站客户端是共享的（issue #144：Windows 上每次新建要 ~1 秒），
         # 退出时统一关掉，别把连接池与 SSL 上下文丢在原地。
         await config.close_clients()
+
+
+def _warn_weak_upstream_key() -> None:
+    """上游 api_key 为空或仍是样例值时点名警告（2026-10-21 安全检查 H3）。
+
+    随包上游 workbuddy2api 的鉴权是「api_key 非空才启用」：为空时 /v1 对话、
+    /status、统计、管理端点全部无需凭据即可访问，且它的启动日志只打一个布尔
+    值，用户很难察觉。本面板是它的前置入口，部署形态下端口已收敛回环，但
+    只要 7863 被改绑到对外地址（或同机其他进程可达），弱 key 就等于公开。
+    读不到配置（本地开发没有上游）时静默跳过。
+    """
+    try:
+        cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+    except Exception:  # noqa: BLE001
+        return
+    key = str(cfg.get('api_key') or '').strip()
+    if not key:
+        logger.error(
+            '上游 config.json 的 api_key 为空：%s 的全部端点（对话、状态、统计、'
+            '管理）此刻不需要任何凭据。请在「设置 → 上游」立即配置强 api_key。',
+            config.UPSTREAM_CONFIG,
+        )
+    elif key.lower() in ('test_key', 'changeme', 'your_api_key'):
+        logger.error(
+            '上游 api_key 仍是样例值 %r：等同于公开，任何知道默认值的人都能'
+            '消耗账号池积分。请立即改为强随机值。', key,
+        )
 
 
 def _warn_if_exposed() -> None:
@@ -101,7 +148,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.9.0',
+    version='2.11.13',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -111,17 +158,26 @@ app = FastAPI(
     openapi_url='/openapi.json' if config.ENABLE_DOCS else None,
 )
 
+def _validate_cors_origins(origins: list[str]) -> None:
+    """`*` 与凭据模式互斥：命中直接抛错，让服务起不来（配置错误要在启动时暴露）。"""
+    if any(o.strip() == '*' for o in origins):
+        raise RuntimeError(
+            'WB_CORS_ORIGINS 含 `*` 且管理端启用 Cookie 凭据：任意网站都能冒用'
+            '管理员身份读写 /api/*。请改为列出具体来源（逗号分隔），或留空'
+            '（同源部署，默认）。'
+        )
+
+
 if config.CORS_ORIGINS:
     # 只允许**明确列出的**来源。绝不要把 WB_CORS_ORIGINS 设成 `*`：
     # 本应用用 Cookie 认证管理端，而 Starlette 在 allow_credentials=True 时
     # 会把 `*` 回显成请求方 Origin（不是字面 `*`），于是**任意网站**都能带着
     # 管理员的 Cookie 调 /api/* 并读到响应 —— 等于把控制台交给任何网页。
     # 留空（默认）即同源部署，安全。
-    if any(o.strip() == '*' for o in config.CORS_ORIGINS):
-        logging.getLogger('workbuddy').error(
-            'WB_CORS_ORIGINS 含 `*` 且已启用凭据：任意网站都能冒用管理员身份读取 '
-            '/api/*。请改为列出具体来源，或留空（同源部署）。'
-        )
+    #
+    # 这是"误配即全面接管"的开关，因此检测到 `*` 直接拒绝启动，而不是只记
+    # 一条日志继续跑：日志拦不住照抄配置的人，历史上确有人这么配过。
+    _validate_cors_origins(config.CORS_ORIGINS)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=config.CORS_ORIGINS,
@@ -149,9 +205,9 @@ async def limit_api_body(request: Request, call_next):
     """给 `/api/*` 的请求体加上限（上传升级包那条路放宽，见上面的常量）。
 
     只看 `Content-Length`：本中间件拦的是「声明了超大长度」这条最容易发起、
-    也最容易自动化的路径（无鉴权即可打 /api/login）。ASGI 在中间件之前不会把
-    body 读进内存，所以先声明后读没有意义；不带该头的分块请求由 uvicorn 自身的
-    缓冲与并发限制兜底。
+    也最容易自动化的路径（无鉴权即可打 /api/login），不用读流就能立即拒绝。
+    不带该头的分块请求在这里声明为 0、拦不住，由下面的
+    `ApiBodyLimitMiddleware` 在**实际读取层**强制。
     """
     if request.url.path.startswith('/api/'):
         try:
@@ -167,9 +223,72 @@ async def limit_api_body(request: Request, call_next):
             )
     return await call_next(request)
 
+
+class _ApiBodyTooLarge(Exception):
+    """内部信号：/api/* 请求体在读取层超过上限。
+
+    注意：路由里 `except Exception` 很常见（`/api/login` 解析失败就转 400），
+    所以它不一定能到达中间件变成 413 —— 被就地转成 400 也是**安全**的：
+    超限时读取已经中止，内存不再增长。声明 413 只在这条异常成功穿透路由时生效。
+    """
+
+
+class ApiBodyLimitMiddleware:
+    """在 ASGI receive 层强制 `/api/*` 的请求体上限。
+
+    为什么上面的 Content-Length 预检不够：分块传输（chunked）没有该头，
+    `declared` 为 0 直接放行；而 handler 里的 `await request.json()` 会把整个
+    body 无上限地聚合进内存（Starlette 的 `Request.body()` 逐块追加，uvicorn
+    自身也不设请求体上限）。`/api/login` 是未鉴权可达的，少量并发分块大请求
+    就能把这个进程（管理面、/v1 网关、静态托管同体）的内存吃光。
+    网关那条路早有同款读取层限额（`gateway._read_json_body`），这里补管理面。
+
+    实现：包住 receive 通道逐块计数，超限即抛内部异常中止 handler，由本层
+    （异常向外传播的必经之路）直接发 413。此时 handler 还在读 body、尚未
+    开始写响应，所以 413 是该连接上唯一的响应，不会出现"半个响应 + 413"。
+    """
+
+    def __init__(self, app, *, limit: int = MAX_API_BODY_BYTES,
+                 package_limit: int = MAX_PACKAGE_BODY_BYTES,
+                 package_paths: tuple = PACKAGE_UPLOAD_PATHS) -> None:
+        self.app = app
+        self.limit = limit
+        self.package_limit = package_limit
+        self.package_paths = package_paths
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http' or not scope.get('path', '').startswith('/api/'):
+            await self.app(scope, receive, send)
+            return
+        limit = (self.package_limit
+                 if scope['path'] in self.package_paths else self.limit)
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get('type') == 'http.request':
+                received += len(message.get('body') or b'')
+                if received > limit:
+                    raise _ApiBodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _ApiBodyTooLarge:
+            response = JSONResponse(
+                {'detail': f'请求体过大（上限 {limit // 1024 // 1024} MB）'},
+                status_code=413,
+            )
+            await response(scope, receive, send)
+
+
+app.add_middleware(ApiBodyLimitMiddleware)
+
 # ── 路由注册顺序很重要：先 API / 网关，最后挂静态文件 ──
 app.include_router(auth.router)
 app.include_router(accounts.router)
+app.include_router(accountrisk_router.router)
 app.include_router(keys.router)
 # 红包：批量发放带额度的密钥（与密钥同属「分发」这件事，所以挨着放）
 app.include_router(redpackets.router)
@@ -185,12 +304,15 @@ app.include_router(settings.router)
 app.include_router(proxies.router)
 # PostgreSQL 异地备份：把本地数据镜像出去、需要时拉回来（见 services/pgsync）
 app.include_router(pgsync_router.router)
+app.include_router(watchdog_router.router)
 # 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
 app.include_router(upstreams.router)
 app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
 app.include_router(gateway.router)
+# 余额协议（/api/usage/token/ 与 /api/status）：客户端面板据此显示剩余额度
+app.include_router(balance.router)
 # Anthropic Messages API 兼容层（/v1/messages）——给只认该协议的客户端用
 app.include_router(anthropic.router)
 # OpenAI Responses API 兼容层（/v1/responses、/responses）——给 Codex /
@@ -362,6 +484,23 @@ def _rsc_page_for(full_path: str) -> str | None:
     return f'/{stem}' if stem else '/'
 
 
+@app.exception_handler(_StarletteHTTPException)
+async def _json_http_error(request: Request, exc: _StarletteHTTPException) -> JSONResponse:
+    """`/v1`、`/v2` 下的 404/405 一律回 JSON。
+
+    以前 `GET /v1/chat/completions` 会落到 SPA 兜底、返回整页 HTML（还带 404 的
+    Next 外壳），客户端解析 HTML 只能得到更难排查的错误。其余路径保持原样。
+    """
+    headers = getattr(exc, 'headers', None)
+    if request.url.path.startswith(('/v1/', '/v2/')):
+        code = 'method_not_allowed' if exc.status_code == 405 else 'not_found'
+        return JSONResponse({'error': {'message': str(exc.detail),
+                                       'type': 'invalid_request_error',
+                                       'code': code}},
+                            status_code=exc.status_code, headers=headers)
+    return JSONResponse({'detail': exc.detail}, status_code=exc.status_code, headers=headers)
+
+
 if config.STATIC_DIR.is_dir():
     app.mount('/_next', StaticFiles(directory=str(config.STATIC_DIR / '_next')), name='next-assets')
     if (config.STATIC_DIR / 'favicon.ico').exists():
@@ -375,6 +514,12 @@ if config.STATIC_DIR.is_dir():
 
     @app.get('/{full_path:path}', include_in_schema=False)
     def spa(full_path: str, request: Request):
+        # 网关路径绝不该落到 SPA 外壳：宁可回一条 JSON 404，也不要把首页 HTML
+        # 当成接口响应发给客户端。
+        if full_path.startswith(('v1/', 'v2/')):
+            return JSONResponse({'error': {'message': f'未知的接口路径 /{full_path}',
+                                           'type': 'invalid_request_error',
+                                           'code': 'not_found'}}, status_code=404)
         # 优先命中导出的静态页面 / 资源，否则回退到 404 页面。
         # 所有路径都必须先通过 _safe_static_path（越界即 None → 404）。
         #
